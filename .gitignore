@@ -26,7 +26,8 @@ plan_scan_gui.json.tmp
 
 # ---- 本地截图（可能含真实 IP / 真实频道表）----
 *.png
-!docs/*.png                      # README 用的演示截图（已确保无真实数据）
+# README 用的演示截图（已确保无真实数据），单独放行
+!docs/*.png
 
 # ---- 本地工作记忆：含真实 IP、运营商名、实测过程数据 ----
 .workbuddy/
