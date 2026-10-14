@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CHANNEL-SET band="SATELLITE" date="2026-1-1" equipment="RANGERNeo 4" name="DEMO-C-Band" trademark="PROMAX ELECTRONICA, S.L" version="1.0">
+<HEADER>
+<LNB-LOC-OSC>
+<BAND_C value="5150" units="MHz"/>
+</LNB-LOC-OSC>
+</HEADER>
+<CHANNELS>
+<CHANNEL name="3780" downlink="3780.00" units="MHz">
+<SIGNAL>
+<DVB-S>
+<SYMBOLRATE value="12000" units="kSymb/s" />
+</DVB-S>
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="3900" downlink="3900.00" units="MHz">
+<SIGNAL>
+<DVB-S2>
+<SYMBOLRATE value="20000" units="kSymb/s" />
+</DVB-S2>
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="4040" downlink="4040.00" units="MHz">
+<SIGNAL>
+<DVB-S>
+<SYMBOLRATE value="8500" units="kSymb/s" />
+</DVB-S>
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="4120" downlink="4120.00" units="MHz">
+<SIGNAL>
+<DVB-S>
+<SYMBOLRATE value="15000" units="kSymb/s" />
+</DVB-S>
+</SIGNAL>
+</CHANNEL>
+</CHANNELS>
+</CHANNEL-SET>

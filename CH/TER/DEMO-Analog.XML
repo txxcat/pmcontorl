@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CHANNEL-SET band="TERRESTRIAL" date="2026-1-1" equipment="RANGERNeo 4" name="DEMO-Analog" trademark="PROMAX ELECTRONICA, S.L." version="2.0">
+<HEADER>
+<TV system="PAL" standard="DK"/>
+<LNB>EXTERNAL</LNB>
+</HEADER>
+<CHANNELS>
+<CHANNEL name="113.25-Z03" frequency="116" units="MHz" >
+<SIGNAL>
+<ANALOGTER />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="787.25-DS52" frequency="790" units="MHz" >
+<SIGNAL>
+<ANALOGTER />
+</SIGNAL>
+</CHANNEL>
+</CHANNELS>
+</CHANNEL-SET>

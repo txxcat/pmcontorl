@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CHANNEL-SET band="SATELLITE" date="2026-1-1" equipment="RANGERNeo 4" name="DEMO-Ku-Band" trademark="PROMAX ELECTRONICA, S.L." version="1.0">
+<HEADER>
+<LNB-LOC-OSC>
+<BAND_KUKA high="11300" low="11300" units="MHz"/>
+</LNB-LOC-OSC>
+</HEADER>
+<CHANNELS>
+<CHANNEL name="12269.5" downlink="12269.50" units="MHz">
+<SIGNAL>
+<DVB-S>
+<SYMBOLRATE value="18000" units="kSymb/s" />
+</DVB-S>
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="12395" downlink="12395.00" units="MHz">
+<SIGNAL>
+<DVB-S>
+<SYMBOLRATE value="27500" units="kSymb/s" />
+</DVB-S>
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="12515" downlink="12515.00" units="MHz">
+<SIGNAL>
+<DVB-S>
+<SYMBOLRATE value="27500" units="kSymb/s" />
+</DVB-S>
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="12675" downlink="12675.00" units="MHz">
+<SIGNAL>
+<DVB-S2>
+<SYMBOLRATE value="27500" units="kSymb/s" />
+</DVB-S2>
+</SIGNAL>
+</CHANNEL>
+</CHANNELS>
+</CHANNEL-SET>

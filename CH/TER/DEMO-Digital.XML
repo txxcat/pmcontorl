@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CHANNEL-SET band="TERRESTRIAL" date="2026-1-1" equipment="RANGERNeo 4" name="DEMO-Digital" trademark="PROMAX ELECTRONICA, S.L." version="2.0">
+<HEADER>
+<TV system="PAL" standard="I"/>
+</HEADER>
+<CHANNELS>
+<CHANNEL name="474-DS13" frequency="474.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="482-DS14" frequency="482.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="490-DS15" frequency="490.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="498-DS16" frequency="498.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="506-DS17" frequency="506.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="514-DS18" frequency="514.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="522-DS19" frequency="522.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="530-DS20" frequency="530.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="538-DS21" frequency="538.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="546-DS22" frequency="546.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="554-DS23" frequency="554.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+<CHANNEL name="562-DS24" frequency="562.00" units="MHz" >
+<SIGNAL>
+<DVB-C />
+</SIGNAL>
+</CHANNEL>
+</CHANNELS>
+</CHANNEL-SET>
