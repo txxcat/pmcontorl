@@ -22,12 +22,15 @@
      就能自动搜出符号率/制式（实测：整表无 SYMBOLRATE 的 8 个
      频点全部一次锁定）。早期版本曾用"SR 不匹配→锁不上"，**那是错的**、已删。
 4. **锁定状态机**（锁定只由**等待时间**决定）
-   - 调谐后需要**连续等待** lock_time 秒才 LOCKED=ON
-   - **重发 `*TUNE` 会重置捕获过程**（锁不上）—— 复现"重试时重发 TUNE 越试越糟"
+   - 调谐后需要**连续等待**够时间才 LOCKED=ON；**重发 `*TUNE` 会重置计时**
+     （复现"重试时重发 TUNE 越试越糟"）
    - ANALOG 制式**永不 LOCKED=ON**（连续载波），但有 LEVEL/CN 读数
-   - 🔴 **按真机实测注入慢锁**：
-     · **射频（地面）一律一次锁** —— 实测运作极好，不再注入 unlock（省时间）
-     · 只有**卫星的个别频道**按实测注入（见 `SLOW_LOCK` 表，键为「频段+中频MHz」）
+   - 🔴 **锁定时间按频段给**（这正是本模拟器要复现的现场痛点）：
+     · **射频（地面）极快** → 客户端 settle_ter 一次等待就够 → **一律一次锁**
+     · **卫星基线较慢**，**个别卫星频道更慢**（见 `SLOW_LOCK`）→ 触发自动重试，
+       极端情况下 5 次重试用尽仍锁不上 → 记为「锁定失败」（数据不全）
+     ⚠️ 早期版本用**一个全局** lock_time 同时套两段，导致射频"总是超时重试"、
+     卫星"一路顺畅"，**与现场正好相反**。锁定时间必须按频段分开。
 5. **NAK 行为**：`*TUNE PLAN=` 恒 NAK、`LNB OUTPUT=0` NAK、`STANDARD=DK/BG` NAK。
 6. **回显**：`*?SIGNAL`（TYPE + SR）、`*?LNB`（AVAILABLE 列表）、
    `*?INSTALLATION CURRENT`（多行 + NAME/TER-CH/SAT-CH）、`*?TUNE`（含 DL/MODE）。
@@ -42,13 +45,15 @@
 ----
   python mock_promax_server.py                       # 127.0.0.1:2222
   python mock_promax_server.py --fail-first 2        # 每频点前 2 次报 LOCKED=OFF
-  python mock_promax_server.py --lock-time 6         # 调谐后需连续等 6s 才锁定
+  python mock_promax_server.py --lock-sat 12         # 卫星基线改成需连续等 12s
+  python mock_promax_server.py --lock-ter 1.5        # 射频改成需连续等 1.5s
   python mock_promax_server.py --plan DEMO-C-Band    # 只加载指定表（可多次）
   python mock_promax_server.py --list-plans          # 列出可用表后退出
 
-🔴 锁定模型（默认，按真机实测标定）
-  · 射频（地面 / TER）：**一律一次锁**（不注入 unlock）
-  · 卫星（SAT）：只有个别频道注入慢锁，见 SLOW_LOCK 表（键为「频段+中频MHz」）
+🔴 锁定模型（默认）
+  · 射频（TER）：0.15s → 客户端 settle_ter=0.3s 一次等待即锁 → **一次锁**
+  · 卫星（SAT）：基线 2.0s → 客户端 settle_sat=3.0s 一次等待即锁 → **一次锁**
+  · 卫星个别频道按 SLOW_LOCK 表要 8~16s → **触发 1~2 次自动重试**
   · `--fail-first N` 可强行让**所有**频点前 N 次报 OFF（用于专门测重试）
 
 调试开关
@@ -105,39 +110,69 @@ LOCK_LEVEL_MIN = 40.0                     # 电平低于此值视为无信号
 #    C 波段本振 5150：IF = 5150 − downlink。
 # 客户端只在首尝试发 TUNE，重试只延长等待 → 加长等待后会自然锁上（与真机一致）。
 # 慢锁注入表：键 (频段, 中频MHz) → 前 N 次测量报 LOCKED=OFF
+# ---------------------------------------------------------------------------
+# 🔴 锁定时间模型 —— **每频道一个「锁定所需连续等待秒数」**
+# ---------------------------------------------------------------------------
+# 真机行为：调谐后必须**连续等待**够时间才会 LOCKED=ON；中途重发 *TUNE 会重新计时。
+#
+# ⚠️ 为什么必须分频段：客户端两侧的等待差 10 倍（射频 settle 0.3s / 卫星 3.0s）。
+#    早期只用**一个全局** lock_time=3.0 同时套两段，结果：
+#      · 射频 0.3s 一次等不够 3s → 攒 10 次才锁上 → 看着像"射频总是超时重试"
+#      · 卫星首次就等 3.0s，已经够 3s → 一次锁 → 看着像"卫星一路顺畅"
+#    正好和现场相反。所以锁定时间必须**按频段**给，卫星个别频道再单独加长。
+LOCK_TIME = {
+    "TER": 0.15,     # 射频：几乎瞬时锁定（客户端 settle_ter=0.3s 绰绰有余）→ 一律一次锁
+    "SAT": 2.0,      # 卫星基线：多数频道首次等待（3.0s）即可锁 → 一次锁
+}
+
+# 个别卫星频道需要更长的连续等待 → 触发客户端的自动重试（这就是要复现的痛点）。
+# 值 = **需要的连续等待秒数**（不是"前几次 OFF"）。
+#
+# 客户端累计等待（生产参数 settle=3 / retry=5 / step=6）：
+#   第1次 3s → 第2次 12s → 第3次 27s → 第4次 48s → 第5次 75s
+# 于是：  8.0s → 第 2 次锁上（重试 1 回）
+#        16.0s → 第 3 次锁上（重试 2 回）
+#        80.0s → 5 次重试用尽仍锁不上 → 记为「锁定失败」（数据不全的痛点）
 #
 # 分两组：
 #   1) 「现场实测组」—— 按真机实测标定的中频（C 波段本振 5150）。
-#      用自己机器的频道表时，把这些中频换成你实测到的即可。
+#      用自己机器的频道表时，把这些中频/秒数换成你实测到的即可。
 #   2) 「DEMO 演示组」—— 对应仓库自带 CH/SAT/DEMO-C-Band.XML 的中频，
 #      保证开箱（无真实表）也能演示慢锁与自动重试。
 SLOW_LOCK = {
     # —— 现场实测组（可按自己仪器改）——
-    ("SAT", 1400): 1,
-    ("SAT", 1199): 2,
-    ("SAT", 1150): 1,
-    ("SAT", 979): 1,
-    ("SAT", 1330): 1,
-    ("SAT", 990): 2,
+    ("SAT", 1400): 8.0,
+    ("SAT", 1199): 8.0,
+    ("SAT", 1150): 8.0,
+    ("SAT", 979): 8.0,
+    ("SAT", 1330): 8.0,
+    ("SAT", 990): 16.0,
     # —— DEMO 演示组（DEMO-C-Band：下行 3780/3900/4040/4120）——
-    ("SAT", 1370): 1,
-    ("SAT", 1250): 2,
-    ("SAT", 1110): 1,
-    ("SAT", 1030): 1,
+    ("SAT", 1370): 8.0,
+    ("SAT", 1250): 16.0,
+    ("SAT", 1110): 8.0,
+    ("SAT", 1030): 8.0,
 }
 
 # DEMO 演示表（仓库自带）的慢锁中频集合，用于启动横幅分组显示
 DEMO_SLOW_IFS = {1370, 1250, 1110, 1030}
 
 
-def slow_lock_attempts(band, if_mhz):
-    """该 (频段,中频) 需要「前几次」报 OFF；不在表里 → 0（一次锁）"""
-    if not if_mhz:
-        return 0
-    try:
-        return SLOW_LOCK.get((band, int(round(float(if_mhz)))), 0)
-    except (TypeError, ValueError):
-        return 0
+def lock_seconds(band, if_mhz):
+    """该 (频段,中频) 锁定所需的**连续等待秒数**。
+
+    卫星频道若在 SLOW_LOCK 表里 → 用表里的值；否则用该频段的基线值。
+    射频一律用 LOCK_TIME["TER"]（很快，客户端一次等待就够）。
+    """
+    base = LOCK_TIME.get(band, LOCK_TIME["TER"])
+    if band == "SAT" and if_mhz:
+        try:
+            key = (band, int(round(float(if_mhz))))
+            if key in SLOW_LOCK:
+                return SLOW_LOCK[key]
+        except (TypeError, ValueError):
+            pass
+    return base
 
 
 # 调试：设环境变量 MOCK_SLOW_DBG=1 时，把慢锁判定打到 stderr
@@ -538,7 +573,6 @@ def _reset_lock():
 
 def _measure():
     st = STATE
-    lock_time = STATE.lock_time
     pt = nearest_point(st.band, st.freq_khz)
     attempts = st.next_attempt()
 
@@ -552,23 +586,18 @@ def _measure():
     has_signal = pt is not None
 
     # ---- 锁定 ----
-    locked = st.is_locked(lock_time)
+    # 锁定所需连续等待**按频段 + 按频道**取（见 LOCK_TIME / SLOW_LOCK）：
+    # 射频极快（一次锁），卫星基线 2s，个别卫星频道要 8~16s → 触发自动重试。
+    need_s = lock_seconds(st.band, (pt or {}).get("if_mhz"))
+    locked = st.is_locked(need_s)
     if pt_analog:
         locked = False      # 模拟制式永不锁定
 
-    # ---- 注入失败：按真机实测给「个别卫星频道」加慢锁 ----
-    # 射频一律一次锁（不浪费时间）；只有卫星个别频道
-    # 频点需要多次尝试。--fail-first 仍保留（用于强行测重试路径）。
-    _dbg_info = None
+    # ---- 额外注入（--fail-first，用于强行测重试路径）----
+    _dbg_info = "band=%s need=%.1fs attempt=%s" % (st.band, need_s, attempts)
     if st.fail_first and attempts <= st.fail_first:
         locked = False
-        _dbg_info = "fail_first"
-    elif pt is not None:
-        slow = slow_lock_attempts(st.band, pt.get("if_mhz"))
-        _dbg_info = "band=%s if=%s slow=%s attempt=%s" % (
-            st.band, pt.get("if_mhz"), slow, attempts)
-        if slow and attempts <= slow:
-            locked = False
+        _dbg_info += " fail_first"
     if _SLOW_DBG:
         sys.stderr.write("[slow-dbg] %s -> LOCKED=%s\n"
                          % (_dbg_info, "ON" if locked else "OFF"))
@@ -740,9 +769,14 @@ def main():
     ap.add_argument("--list-plans", action="store_true", help="列出加载的表后退出")
     ap.add_argument("--fail-first", type=int, default=0,
                     help="同一频点前 N 次测量返回 LOCKED=OFF，用于测重试逻辑")
-    ap.add_argument("--lock-time", type=float, default=3.0,
-                    help="调谐后需连续等待 N 秒才 LOCKED=ON（默认 3.0，"
-                         "对齐现场 settle_sat；真机要数秒）")
+    ap.add_argument("--lock-ter", type=float, default=None,
+                    help="射频锁定所需连续等待秒数（默认 %.2f，客户端 settle_ter 即 "
+                         "0.3s → 一次锁）" % LOCK_TIME["TER"])
+    ap.add_argument("--lock-sat", type=float, default=None,
+                    help="卫星**基线**锁定所需连续等待秒数（默认 %.1f，客户端 settle_sat "
+                         "=3.0s → 一次锁）；个别频道另见 SLOW_LOCK 表" % LOCK_TIME["SAT"])
+    ap.add_argument("--lock-time", type=float, default=None,
+                    help="全局覆盖：同时设 --lock-ter 与 --lock-sat（旧参数，兼容用）")
     ap.add_argument("--quiet", action="store_true", help="不打印收发包")
     ap.add_argument("--slow", type=float, default=0.0,
                     help="每条响应额外延迟 N 秒（模拟真机响应慢）")
@@ -754,7 +788,13 @@ def main():
     SLOW = a.slow
     SINGLE = a.single
     STATE.fail_first = a.fail_first
-    STATE.lock_time = a.lock_time
+    # 锁定时间：分频段可调；--lock-time 作全局覆盖（旧参数兼容）
+    if a.lock_time is not None:
+        LOCK_TIME["TER"] = LOCK_TIME["SAT"] = a.lock_time
+    if a.lock_ter is not None:
+        LOCK_TIME["TER"] = a.lock_ter
+    if a.lock_sat is not None:
+        LOCK_TIME["SAT"] = a.lock_sat
 
     load_plan_dir(a.plans or default_plans_dir(), a.plan)
     POINTS = all_points()
@@ -776,19 +816,23 @@ def main():
 
     if a.fail_first:
         print("注入：每频点前 %d 次测量返回 LOCKED=OFF" % a.fail_first)
-    print("锁定模型：调谐后连续等待 %.1fs 才 LOCKED=ON；重发 *TUNE 会重新计时"
-          % a.lock_time)
+    print("锁定模型：调谐后**连续等待**够时间才 LOCKED=ON；重发 *TUNE 会重新计时")
+    print("  射频 TER：需等待 %.2fs（客户端 settle_ter 即 0.3s → 一次锁）"
+          % LOCK_TIME["TER"])
+    print("  卫星 SAT：基线 %.1fs（客户端 settle_sat = 3.0s → 一次锁）"
+          % LOCK_TIME["SAT"])
     if SLOW_LOCK:
         demo = {k: v for k, v in SLOW_LOCK.items() if k[1] in DEMO_SLOW_IFS}
         field = {k: v for k, v in SLOW_LOCK.items() if k not in demo}
+
+        def _fmt(items):
+            return "、".join("中频%dMHz需%.0fs" % (iff, s)
+                            for (b, iff), s in sorted(items.items()))
+
         if demo:
-            print("慢锁注入（DEMO 演示表）：%s"
-                  % "、".join("中频%dMHz×%d次" % (iff, n)
-                              for (b, iff), n in sorted(demo.items())))
+            print("  卫星慢锁（DEMO 演示表）：%s" % _fmt(demo))
         if field:
-            print("慢锁注入（现场实测标定）：%s"
-                  % "、".join("中频%dMHz×%d次" % (iff, n)
-                              for (b, iff), n in sorted(field.items())))
+            print("  卫星慢锁（现场实测标定）：%s" % _fmt(field))
     print("NAK 复现：*TUNE PLAN= 恒 NAK / LNB OUTPUT=0 NAK / SIGNAL STANDARD=DK NAK")
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

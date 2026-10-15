@@ -35,11 +35,20 @@ def check(label, cond, extra=""):
         print("  [!! ] %s %s" % (label, extra))
 
 
-def measure_locked(inst, max_tries=6, wait=WAIT):
+def measure_locked(inst, max_tries=20, wait=WAIT, poll=1.0):
     """连续测量直到 LOCKED=ON（最多 max_tries 次），返回 (lock, allv, tries)。
 
-    2026-10-14：模拟器现在会按实测给**个别卫星中频**注入慢锁（前 N 次 OFF），
-    所以"等够时间就必定 ON"的断言要允许重试若干次。重试**不重发 TUNE**。
+    2026-10-14：模拟器现在会按实测给**个别卫星中频**注入慢锁（前若干次 OFF），
+    所以"等够时间就 ON"的断言要允许按需重试。重试**不重发 TUNE**。
+
+    wait   —— 第一次调用前的预等待（默认 = LOCK_TIME + 0.8s，让基线频道先锁上）
+    poll   —— 每次失败后的轮询间隔（默认 1.0s，确保 20s 总 budget 能覆盖
+              SLOW_LOCK 表里 ≤16s 的所有慢锁频道）
+    max_tries 默认 20：与客户端生产参数 retry=5 + retry_step=6（累计等待 3/9/15/21/27
+              秒，最深 33s）大致对齐，能覆盖 16s 频道。
+
+    2026-10-15：原版每次失败后只 sleep(0.4)，导致 SLOW_LOCK=16.0s 的频道在
+    max_tries 内永远 OFF。本版改用 poll=1.0 默认。
     """
     try:
         time.sleep(wait)
@@ -48,7 +57,8 @@ def measure_locked(inst, max_tries=6, wait=WAIT):
             lk = str(allv.get("LOCKED", (None, ""))[1]).upper()
             if lk == "ON":
                 return lk, allv, n
-            time.sleep(0.4)
+            if n < max_tries:
+                time.sleep(poll)
         return lk, allv, max_tries
     except Exception as e:                       # pragma: no cover
         return "ERR:%s" % e, {}, max_tries
@@ -159,7 +169,9 @@ for label, if_k, want_off in (
     lk1 = str(allv.get("LOCKED", (None, ""))[1]).upper()
     if want_off:
         check("%s：第1次 OFF" % label, lk1 == "OFF", "LOCKED=%s" % lk1)
-        lk, allv, tries = measure_locked(inst, max_tries=want_off + 2, wait=0.0)
+        # 2026-10-15：max_tries=want_off+2 在 poll=0.4 时不够，现在默认 poll=1.0；
+        # 但 8s/16s 频道仍需足量次数才能等到 → 显式放宽到 20 次以涵盖 SLOW_LOCK_max=16s
+        lk, allv, tries = measure_locked(inst, max_tries=20, wait=0.0)
         check("%s：等够后 ON" % label, lk == "ON", "第%d次" % (tries + 1))
     else:
         check("%s：第1次即 ON" % label, lk1 == "ON", "LOCKED=%s" % lk1)

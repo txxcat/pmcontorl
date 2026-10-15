@@ -52,13 +52,21 @@ DEFAULT_CONFIG = {
     "out_dir_history": [],
     "settle": 0.15,
     # 稳定等待：卫星锁定比射频慢，必须分开设
+    # 默认值来自真机实测（2026-10-15 收敛），是各频段的最佳值：
+    #   · 射频 settle=0.3s → 一次锁
+    #   · 卫星 settle=3.0s → 基线一次锁；个别慢锁频道需触发自动重试
     "settle_ter": 0.3,
-    "settle_sat": 1.0,
-    # 锁定失败重试（保证数据完整性）
+    "settle_sat": 3.0,
+    # 锁定失败重试（保证卫星数据完整性，这是本程序的核心诉求）：
+    #   · 射频 retry=3, step=0.3 → 累计等待 0.3 / 0.6 / 0.9 / 1.2s，远超基线
+    #     （射频 LOCK_TIME=0.15s），所以**永远一次锁**，重试是兜底
+    #   · 卫星 retry=5, step=6 → 累计等待 3 / 9 / 15 / 21 / 27s，能覆盖
+    #     SLOW_LOCK 里 8~16s 的个别慢锁频道（验过：8s→第2次锁、16s→第3次锁），
+    #     极端 80s+ 的也允许 5 次后判失败。
     "retry_ter": 3,             # 射频重试次数
-    "retry_sat": 3,             # 卫星重试次数
-    "retry_step_ter": 1.0,      # 射频每次重试增加的稳定等待（秒）
-    "retry_step_sat": 1.0,      # 卫星每次重试增加的稳定等待（秒）
+    "retry_sat": 5,             # 卫星重试次数
+    "retry_step_ter": 0.3,      # 射频每次重试增加的稳定等待（秒）
+    "retry_step_sat": 6.0,      # 卫星每次重试增加的稳定等待（秒）
     "pause_between": True,      # 手动多选时，表间是否暂停（默认暂停）
     # 结果文件格式：xlsx（带表头样式）/ csv（通用，Excel 可直接打开）
     "export_format": "xlsx",
@@ -312,18 +320,25 @@ def band_settings(cfg, band):
     band: 'TER' | 'SAT'
     返回 (settle, retry, retry_step)
     兼容旧配置：没有 settle_ter/settle_sat 时回退到 settle。
+    默认值与 DEFAULT_CONFIG 保持一致（实测最佳）：
+      · 射频  0.3 / 3 / 0.3
+      · 卫星  3.0 / 5 / 6.0
     """
     sfx = "ter" if band == "TER" else "sat"
+    if band == "TER":
+        fb_settle, fb_retry, fb_step = 0.3, 3, 0.3
+    else:
+        fb_settle, fb_retry, fb_step = 3.0, 5, 6.0
     try:
-        settle = float(cfg.get("settle_" + sfx, cfg.get("settle", 0.15)))
+        settle = float(cfg.get("settle_" + sfx, cfg.get("settle", fb_settle)))
     except (TypeError, ValueError):
-        settle = 0.3 if band == "TER" else 1.0
+        settle = fb_settle
     try:
-        retry = int(cfg.get("retry_" + sfx, 3))
+        retry = int(cfg.get("retry_" + sfx, fb_retry))
     except (TypeError, ValueError):
-        retry = 3
+        retry = fb_retry
     try:
-        step = float(cfg.get("retry_step_" + sfx, 1.0))
+        step = float(cfg.get("retry_step_" + sfx, fb_step))
     except (TypeError, ValueError):
-        step = 1.0
+        step = fb_step
     return settle, max(0, retry), max(0.0, step)

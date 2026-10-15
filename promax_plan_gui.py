@@ -1167,9 +1167,13 @@ class App(object):
         band_box.columnconfigure(1, weight=1, uniform="band")
 
         ents = {}
-        for col, (title, sfx, hint, d_settle) in enumerate((
-                ("射频 TER", "ter", "有线 / 地面，锁定快", 0.3),
-                ("卫星 SAT", "sat", "需对星，锁定慢，等待要留足", 1.0))):
+        for col, (title, sfx, hint, d_settle, d_retry, d_step) in enumerate((
+                # 默认值来自真机实测（与 promax_gui_config.DEFAULT_CONFIG 一致）
+                ("射频 TER", "ter", "有线 / 地面，锁定快（实测一次锁）",
+                 0.3, 3, 0.3),
+                ("卫星 SAT", "sat",
+                 "需对星，锁定慢（实测：基线一次锁，个别频道需 1~2 次重试）",
+                 3.0, 5, 6.0))):
             lf = ttk.LabelFrame(band_box, text=title, padding=10)
             lf.grid(row=0, column=col, sticky="nsew",
                     padx=(0, 6) if col == 0 else (6, 0))
@@ -1179,9 +1183,9 @@ class App(object):
                     ("稳定等待 (秒)", "settle_" + sfx,
                      self.cfg.get("settle_" + sfx, d_settle)),
                     ("锁定重试次数", "retry_" + sfx,
-                     self.cfg.get("retry_" + sfx, 3)),
+                     self.cfg.get("retry_" + sfx, d_retry)),
                     ("重试步进 (秒)", "retry_step_" + sfx,
-                     self.cfg.get("retry_step_" + sfx, 1.0))), 1):
+                     self.cfg.get("retry_step_" + sfx, d_step))), 1):
                 ttk.Label(lf, text=label).grid(row=i, column=0,
                                                sticky="w", pady=3)
                 e = ttk.Entry(lf, width=8, justify="right")
