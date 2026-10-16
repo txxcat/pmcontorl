@@ -58,6 +58,12 @@ def _ts():
     return time.strftime("%H:%M:%S", time.localtime(t)) + ".%03d" % (
         (t % 1) * 1000)
 
+def _fmt_hms(sec):
+    """秒 → `HH:MM:SS`（计时器与日志共用）"""
+    s = max(0, int(sec))
+    return "%02d:%02d:%02d" % (s // 3600, (s // 60) % 60, s % 60)
+
+
 # --------------------------------------------------------------- 频道表模型
 # 「已选频道表」列表的进度配色：正在测 / 已完成 / 还没测
 SEL_ACTIVE_BG = "#ffd966"       # 琥珀：正在测试的这一张
@@ -1009,6 +1015,13 @@ class App(object):
         self.pg_all_done = 0
         self.pg_all_total = 0
 
+        # 计时器：_t_acc=已累计秒；_t_t0=本段起点（monotonic），None=已停表；
+        # _t_on=本轮是否进行中（决定要不要继续定时刷新）
+        self._t_acc = 0.0
+        self._t_t0 = None
+        self._t_on = False
+        self._tick_ac = None
+
         root.title("PROMAX 频道表批量测试")
         w = self.cfg.get("window", {})
         root.geometry("%dx%d" % (w.get("width", 1240), w.get("height", 780)))
@@ -1053,6 +1066,12 @@ class App(object):
                    ).pack(side="left", padx=6)
         self.status = tk.StringVar(value="就绪")
         ttk.Label(top, textvariable=self.status).pack(side="left", padx=10)
+        # ---- 计时器（顶栏最右，紧接「设置」之后）----
+        # 只统计**真正在测**的时间：断线挂起、换线暂停时停表（见 _timer_pause）。
+        # 用等宽字体 + 固定宽度，数字跳动时不会把左边的控件推来推去。
+        self.timer_var = tk.StringVar(value="用时 —")
+        ttk.Label(top, textvariable=self.timer_var, width=24, anchor="e",
+                  font=("Consolas", 10)).pack(side="right")
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", pady=4)
 
@@ -1197,6 +1216,71 @@ class App(object):
         self.pg_all_done = 0
         self.pg_all_total = sum(len(it.points()) for it in items)
         self._update_progress()
+
+    # ---------------- 计时器 ----------------
+    # 需求：顶栏显示本轮测试用时，**暂停时同时停表**。
+    # 「暂停」有三种：断线挂起（MSG_NETLOST→NETOK）、换线暂停（MSG_CONFIRM，
+    # 等用户点「继续」）、以及测试彻底结束。三者都走 _timer_pause，
+    # 恢复走 _timer_resume，结束走 _timer_stop（保留最终用时）。
+    def _timer_set(self, paused=False):
+        """把当前用时刷到顶栏。paused=True 时补一句「已暂停」。"""
+        e = self._t_acc
+        if self._t_t0 is not None:
+            e += time.monotonic() - self._t_t0
+        if e <= 0 and not self._t_on:
+            self.timer_var.set("用时 —")     # 还没跑过
+            return
+        txt = "用时 " + _fmt_hms(e)
+        if paused:
+            txt += "（已暂停）"
+        self.timer_var.set(txt)
+
+    def _timer_tick(self):
+        self._tick_ac = None
+        if not self._t_on:
+            return
+        self._timer_set()
+        self._tick_ac = self.root.after(200, self._timer_tick)
+
+    def _timer_cancel_tick(self):
+        if self._tick_ac is not None:
+            try:
+                self.root.after_cancel(self._tick_ac)
+            except Exception:
+                pass
+            self._tick_ac = None
+
+    def _timer_start(self):
+        """新一轮测试开始：归零、起表。"""
+        self._timer_cancel_tick()
+        self._t_acc = 0.0
+        self._t_t0 = time.monotonic()
+        self._t_on = True
+        self._timer_set()
+        self._timer_tick()
+
+    def _timer_pause(self):
+        """暂停计时（可重复调用，第二次起无副作用）。"""
+        if self._t_t0 is not None:
+            self._t_acc += time.monotonic() - self._t_t0
+            self._t_t0 = None
+        self._timer_set(paused=True)
+
+    def _timer_resume(self):
+        """继续计时（已在跑就不动）。"""
+        if not self._t_on:
+            return
+        if self._t_t0 is None:
+            self._t_t0 = time.monotonic()
+        self._timer_set()
+
+    def _timer_stop(self):
+        """测试结束：停表并保留最终用时，返回总秒数。"""
+        self._timer_pause()          # 先收掉最后一段
+        self._t_on = False
+        self._timer_cancel_tick()
+        self._timer_set()
+        return self._t_acc
 
     # ---------------- 频道表加载 ----------------
     def _scan(self, source):
@@ -1881,6 +1965,7 @@ class App(object):
 
         self.stop_btn.configure(state="normal")
         self.retry_btn.configure(state="disabled")   # 新的一轮：先复位重连按钮
+        self._timer_start()                          # 计时从这一刻起
         self.status.set("测试中...")
         self.root.title("PROMAX 频道表批量测试 — 测试中")
 
@@ -2026,9 +2111,12 @@ class App(object):
             self._update_progress()
             self._log("【%s】完成，共 %d 个频道" % (item.name, len(rows)))
         elif kind == TestEngine.MSG_CONFIRM:
+            # 换线暂停：等用户接好线点「继续」的这段时间**不算**在用时里
+            self._timer_pause()
             self._confirm(payload)
         elif kind == TestEngine.MSG_NETLOST:
             # 断线：测试已暂停（后台在等重连）。亮出「重试连接」，状态栏说明情况。
+            self._timer_pause()          # 等重连的时间也不计入用时
             self.retry_btn.configure(state="normal")
             self.status.set("网络中断，已暂停 — 等待重连")
             self.root.title("PROMAX 频道表批量测试 — 已暂停（网络中断）")
@@ -2038,6 +2126,7 @@ class App(object):
             self._log("   点「中止」则结束本次测试并保存已测得的结果。")
         elif kind == TestEngine.MSG_NETOK:
             self.retry_btn.configure(state="disabled")
+            self._timer_resume()         # 重连成功，继续计时
             n = self.engine.reconnects if self.engine else 0
             self.status.set(("测试中...（已重连 %d 次）" % n) if n else "测试中...")
             self.root.title("PROMAX 频道表批量测试 — 测试中")
@@ -2078,6 +2167,9 @@ class App(object):
         def go(v):
             self.engine.resolve(v)
             win.destroy()
+            if v:
+                self._timer_resume()     # 接好线继续 → 重新计时
+            # 选中止则保持停表，收尾时 _timer_stop 会把最终用时定格
 
         btns = ttk.Frame(win)
         btns.pack(fill="x", padx=16, pady=12)
@@ -2282,6 +2374,8 @@ class App(object):
     def _finish_ui(self):
         self.stop_btn.configure(state="disabled")
         self.retry_btn.configure(state="disabled")   # 测试结束
+        # 停表：顶栏定格在最终用时（暂停期间不计数）
+        used = self._timer_stop()
         # 本轮跑完（或中止）：撤掉"正在测试"的高亮，已完成的行保留绿色
         self.sel_active = None
         self._paint_sel()
@@ -2294,6 +2388,9 @@ class App(object):
         if n:
             self._log("")
             self._log("【网络恢复】本次测试期间断线重连 %d 次（数据已保留）。" % n)
+        self._log("")
+        self._log("【用时】本轮净用时 %s（断线等待 / 换线暂停不计入）"
+                  % _fmt_hms(used))
         stopped = self.engine and self.engine._stop.is_set()
         self.root.title("PROMAX 频道表批量测试")
         if self.rows:
@@ -2308,9 +2405,10 @@ class App(object):
                              sum(len(v) for v in self.rows.values())))
                 if self.log_path:
                     # 收尾：写"测试结束"再关闭（追加式，不删历史）
-                    summary = ("【本次汇总】%d 张表 / %d 条记录\n"
+                    summary = ("【本次汇总】%d 张表 / %d 条记录，净用时 %s\n"
                                % (len(self.rows),
-                                  sum(len(v) for v in self.rows.values())))
+                                  sum(len(v) for v in self.rows.values()),
+                                  _fmt_hms(used)))
                     self._close_log_file(tail=summary)
                     self._log("日志: %s（追加）" % self.log_path)
                     if self.sep_log_path:

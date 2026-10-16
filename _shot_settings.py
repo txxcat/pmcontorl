@@ -270,6 +270,9 @@ def main(which=("main", "settings", "progress")):
                 app._handle(gui.TestEngine.MSG_ROW, (it1, demo_row(it1, i)))
             app.outdir_var.set(r"D:\Demo\Downloads")
             app.out_var.set(r"D:\Demo\Downloads\混合演示_DEMO_20261016.xlsx")
+            # 顶栏计时器：给个有代表性的值（截图用，真跑是从 00:00:00 起涨）
+            app._t_acc = 192.0
+            app._timer_set()
             settle(root, 40)
             assert_no_local_user(root)          # 防线 4
             grab(root, os.path.join("docs", "screenshot-progress.png"), root)
