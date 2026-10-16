@@ -143,6 +143,8 @@ CH/
 
 同理，**快捷测试组与配置写在本地 `plan_scan_gui.json`**（含真实 IP、输出目录历史），
 该文件同样被 `.gitignore` 排除。首次运行会用内置的演示默认值。
+每次保存配置前会滚动备份最近 10 份到同级的 `bak/` 子目录（`plan_scan_gui.json.bak … .bak10`），
+主目录只留当前配置。
 
 ## 目录结构
 
@@ -151,7 +153,7 @@ CH/
 | `promax_plan_gui.py` | GUI 主程序（tkinter） |
 | `promax_plan_dump.py` | 频道表 XML 解析（离线） |
 | `promax_telnet_test.py` | Telnet 连接层与命令封装 |
-| `promax_gui_config.py` | 配置层（json + 滚动备份 + 原子写） |
+| `promax_gui_config.py` | 配置层（json + 滚动备份到 `bak/` + 原子写） |
 | `promax_plan_scan.py` | 命令行版（无 GUI） |
 | `mock_promax_server.py` | 仪器模拟器 |
 | `_selftest_mock.py` | 协议级自检（对模拟器跑） |

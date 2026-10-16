@@ -11,9 +11,11 @@ CH/SAT/*
 
 # ---- 本地配置：真实 IP、真实预设组、输出目录历史 ----
 plan_scan_gui.json
+plan_scan_gui.json.tmp
 plan_scan_gui.json.bak*
 plan_scan_gui.json.bak[0-9]*
-plan_scan_gui.json.tmp
+# 滚动备份子目录（含真实 IP / 预设组）
+bak/
 
 # ---- 测试结果与日志（含真实测量数据）----
 *.xlsx

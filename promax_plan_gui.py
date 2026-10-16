@@ -538,7 +538,7 @@ class TestEngine(object):
         # 注意：返回的 PLAN 与本程序无关（我们按频率调谐，实测 *TUNE PLAN= 恒 NAK，
         # 仪器里的表切不了），所以只用来校验 BAND，不写进结果。
         ch_lines = inst.tune_ch()
-        b_now, p_now, _c = parse_tune_ch(ch_lines)
+        b_now, _p_now, _c = parse_tune_ch(ch_lines)
 
         # 🔴 表级"静默无响应"也要当断线处理（踩过）。
         #    半死的 WiFi 链路不会报 socket 错误，只会一直超时；此时三条表级
@@ -553,13 +553,14 @@ class TestEngine(object):
                 "表级准备阶段仪器连续无响应（链路可能已断）",
                 kind="recv", host=self.host, port=self.port)
 
-        # 只在**状态变化时**才打印：仪器的"当前加载表"远程改不了（*TUNE PLAN=
-        # 恒 NAK），每张表都打一遍是纯噪音。BAND 变了才值得提一句。
-        state = (b_now or "?", p_now or "?")
+        # 只在 BAND **状态变化时**才打印，每张表都打一遍是纯噪音。
+        # ⚠️ 不再显示仪器回报的"当前加载表"（2026-10-16）：该字段在卫星测试时
+        #    始终不准（设备反馈错误），而 *TUNE PLAN= 远程又改不了（31.17 恒 NAK）
+        #    —— 印出来只会误导。测的是哪张表，看界面「当前频道表」即可。
+        state = b_now or "?"
         if state != getattr(self, "_last_inst_state", None):
             self._last_inst_state = state
-            self.log("  仪器状态：BAND=%s  当前加载表=%s（本程序按频率调谐，与该表无关）"
-                     % state)
+            self.log("  仪器状态：BAND=%s" % state)
         if b_now and b_now.strip().upper() != item.band.upper():
             raise PromaxError(
                 "已下发 *TUNE BAND=%s，但仪器仍停在 BAND=%s，已中止"

@@ -180,11 +180,13 @@ def save_config(cfg, path=None):
 
 
 BACKUP_KEEP = 10                # 滚动备份保留份数
+BACKUP_DIRNAME = "bak"          # 备份子目录名（与配置文件同级）
 
 
 def _backup_config(path):
-    """把现有配置滚动备份到 <path>.bak / .bak2 / .bak3 …（保留最近 N 份）。
+    """把现有配置滚动备份到 <配置同级目录>/bak/<名>.bak / .bak2 / …（保留最近 N 份）。
 
+    备份集中放在 bak/ 子目录里，主目录只留当前配置，不被 .bak 系列文件堆满。
     只在现有文件「看起来有效」时备份 —— 避免把损坏内容固化成备份。
     """
     try:
@@ -195,8 +197,13 @@ def _backup_config(path):
         if not data.strip():
             return
         json.loads(data)                    # 不是合法 json 就不备份
+        basedir = os.path.dirname(os.path.abspath(path))
+        bakdir = os.path.join(basedir, BACKUP_DIRNAME)
+        os.makedirs(bakdir, exist_ok=True)
+        base = os.path.basename(path)       # 如 plan_scan_gui.json
         def bname(i):
-            return path + ".bak" if i == 1 else "%s.bak%d" % (path, i)
+            nm = (base + ".bak") if i == 1 else ("%s.bak%d" % (base, i))
+            return os.path.join(bakdir, nm)
         # 删最老的，然后从老到新依次后移
         last = bname(BACKUP_KEEP)
         if os.path.isfile(last):
