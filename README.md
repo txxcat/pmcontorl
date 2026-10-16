@@ -5,8 +5,13 @@
 
 > **目标仪器**：RANGERNeo 4 — High class field strength meter and spectrum analyzer with 4K decoder
 > （固件 `*VER 31.17`，Telnet 端口 `2222`）
+
+**主界面**
+
 ![主界面](docs/pmcontorl_main.png)
-> 
+
+**设置界面**
+
 ![设置界面](docs/screenshot-settings.png)
 
 ---
