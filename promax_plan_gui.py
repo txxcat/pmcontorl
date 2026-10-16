@@ -146,6 +146,17 @@ class TestEngine(object):
         self._cur = {"sig": None, "sat": None}
         # 重连统计（最后一次测试的累计次数，用于日志与 UI 展示）
         self.reconnects = 0
+        # 当前这张表的频点总数（日志里显示「第 n/总」用），_run_points 里赋值
+        self._pt_total = 0
+
+    def _ptag(self, idx):
+        """频点日志前缀：`[  3/20]`。
+
+        总数取自当前表（_run_points 设置）。取不到总数（极端情况）就退化成 `[  3]`，
+        不显示成 `[3/0]` 那种误导性的分母。
+        """
+        t = getattr(self, "_pt_total", 0)
+        return "[%3d/%d]" % (idx, t) if t else "[%3d]" % idx
 
     def stop(self):
         self._stop.set()
@@ -329,8 +340,8 @@ class TestEngine(object):
                     st = r.get("status", "nak")
                     why = {"nak": "仪器拒绝(NAK)",
                            "timeout": "仪器无响应(超时)"}.get(st, st)
-                    self.log("  [%3d] %-14s %9.3f MHz  设置失败：%s"
-                             % (idx, chname, mhz, why))
+                    self.log("  %s %-14s %9.3f MHz  设置失败：%s"
+                             % (self._ptag(idx), chname, mhz, why))
                     if st == "timeout":
                         self.no_resp += 1
                         if self.no_resp >= 3:
@@ -384,21 +395,22 @@ class TestEngine(object):
                     why = "LOCK=%s 未锁定" % (lock or "?")
                 else:
                     why = "未读到电平"
-                self.log("  [%3d] %-14s %9.3f MHz  %s，"
+                self.log("  %s %-14s %9.3f MHz  %s，"
                          "第 %d/%d 次重试（保持同频继续等待 %.1fs → %.1fs）"
-                         % (idx, chname, mhz, why, attempt + 1, retry,
-                            wait, wait + retry_step))
+                         % (self._ptag(idx), chname, mhz, why, attempt + 1,
+                            retry, wait, wait + retry_step))
                 wait += retry_step
             else:
                 if require_lock:
-                    self.log("  [%3d] %-14s %9.3f MHz  LOCK=%s 重试 %d 次仍未锁定，"
+                    self.log("  %s %-14s %9.3f MHz  LOCK=%s 重试 %d 次仍未锁定，"
                              "记录为锁定失败"
-                             % (idx, chname, mhz, lock or "?", retry))
+                             % (self._ptag(idx), chname, mhz, lock or "?",
+                                retry))
                     fail_mark = lock or "FAIL"
                 else:
-                    self.log("  [%3d] %-14s %9.3f MHz  重试 %d 次仍无电平读数，"
+                    self.log("  %s %-14s %9.3f MHz  重试 %d 次仍无电平读数，"
                              "记录为测量失败"
-                             % (idx, chname, mhz, retry))
+                             % (self._ptag(idx), chname, mhz, retry))
                     fail_mark = lock or "NONE"
                 return {"allv": allv, "lock": fail_mark,
                         "attempts": attempts,
@@ -531,6 +543,8 @@ class TestEngine(object):
         self._cur = {"sig": None, "sat": None}   # 制式缓存（本表内有效）
         self.no_resp = 0        # 连续无响应计数，达到阈值就按断线处理
         pts = item.points()
+        # 本表频点总数：日志里统一显示「第 n/总数」，一眼看得出还剩多少
+        self._pt_total = len(pts)
         rows = []
         i = 0
         while i < len(pts):
@@ -640,10 +654,10 @@ class TestEngine(object):
                "total_s": round(m.get("total_s", 0.0), 3)}
         # 频点耗时日志：一眼看出哪些频点接近锁定边界
         if self.cfg_run.get("log_timing", True):
-            self.log("  [%3d] %-14s %9.3f MHz  LOCK=%-4s  调谐=%.2fs "
+            self.log("  %s %-14s %9.3f MHz  LOCK=%-4s  调谐=%.2fs "
                      "等待=%.1fs  总计=%.1fs  (尝试 %d 次)"
-                     % (idx, chname, mhz, lock, row["tune_s"], row["wait_s"],
-                        row["total_s"], attempts))
+                     % (self._ptag(idx), chname, mhz, lock, row["tune_s"],
+                        row["wait_s"], row["total_s"], attempts))
         # 显示键名 → 真机响应里的实际键名。
         # 真机模拟制式(ANALOG)直接返回 LEVEL；数字制式没有 LEVEL，
         # 模拟电平落在 POWER / CH_POWER 上。
@@ -931,6 +945,13 @@ class App(object):
         self.sel_box_keys = []     # Listbox 第 i 行 → 频道表 key
         self.sel_done = set()      # 已测完的 key
         self.sel_active = None     # 正在测试的 key（None = 没在测）
+        # 进度条计数（两个条都用"计数"驱动，见 _update_progress）
+        #   当前频道表：本表已完成频点 / 本表频点总数
+        #   全部      ：**按频道数加权** —— 所有选中表的频点总数，不是表张数
+        self.pg_cur_done = 0
+        self.pg_cur_total = 0
+        self.pg_all_done = 0
+        self.pg_all_total = 0
 
         root.title("PROMAX 频道表批量测试")
         w = self.cfg.get("window", {})
@@ -981,6 +1002,14 @@ class App(object):
 
         body = ttk.Frame(self.root, padding=8)
         body.pack(fill="both", expand=True)
+
+        # ---- 中间区域底部：两个进度条 ----
+        # ⚠️ pack 顺序：`side="bottom"` 必须在 left/right **之前** pack ——
+        #    它们都是 fill/expand，先占位的会把后 pack 的挤出可视区。
+        # 两条都用"计数"显示（ttk.Progressbar 本身不显示数字，自己配标签）：
+        #   当前频道表 = 本表已完成频点 / 本表频点总数
+        #   全部       = 全部已完成频点 / 全部选中表的频点总数（**按频道数加权**）
+        self._build_progress(body)
 
         left = ttk.Frame(body)
         left.pack(side="left", fill="both", expand=True)
@@ -1060,6 +1089,58 @@ class App(object):
         lsb = ttk.Scrollbar(bot, orient="vertical", command=self.log.yview)
         lsb.pack(side="right", fill="y")
         self.log.configure(yscrollcommand=lsb.set)
+
+    # ---------------- 进度条 ----------------
+    def _build_progress(self, parent):
+        """中间区域底部的两条进度条（当前频道表 / 全部）。
+
+        不用 ttk.Progressbar 的数字（它根本不显示数字），
+        比例交给 bar，数字交给右侧标签 `3/20 (15%)`。
+        """
+        box = ttk.Frame(parent)
+        box.pack(side="bottom", fill="x", pady=(8, 0))
+        ttk.Separator(box, orient="horizontal").pack(fill="x", pady=(0, 6))
+
+        rows = (("当前频道表", "pb_cur", "pb_cur_lbl"),
+                ("全部", "pb_all", "pb_all_lbl"))
+        for title, bar_attr, lbl_attr in rows:
+            row = ttk.Frame(box)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=title, width=10).pack(side="left")
+            bar = ttk.Progressbar(row, mode="determinate", maximum=100.0)
+            bar.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            var = tk.StringVar(value="—")
+            ttk.Label(row, textvariable=var, width=18, anchor="e"
+                      ).pack(side="left")
+            setattr(self, bar_attr, bar)
+            setattr(self, lbl_attr, var)
+
+    def _update_progress(self):
+        """按当前计数刷新两条进度条。总数 0 时显示 `—`（而不是 0/0）。"""
+        for bar, var, done, total in (
+                (self.pb_cur, self.pb_cur_lbl, self.pg_cur_done,
+                 self.pg_cur_total),
+                (self.pb_all, self.pb_all_lbl, self.pg_all_done,
+                 self.pg_all_total)):
+            if total <= 0:
+                bar.configure(value=0.0)
+                var.set("—")
+                continue
+            done = max(0, min(done, total))     # 别因补齐逻辑溢出
+            bar.configure(value=100.0 * done / total)
+            var.set("%d/%d (%.0f%%)" % (done, total, 100.0 * done / total))
+
+    def _pg_reset(self, items):
+        """新一轮测试开始：两个条都归零，'全部'总数=选中表的**频点总数**。
+
+        ⚠️ 「全部」必须按**频道数**加权，不能按表的张数 —— 一张 50 频点的表和
+        一张 2 频点的表各占 50% 会严重失真（用户明确要求按频道数量算）。
+        """
+        self.pg_cur_done = 0
+        self.pg_cur_total = 0
+        self.pg_all_done = 0
+        self.pg_all_total = sum(len(it.points()) for it in items)
+        self._update_progress()
 
     # ---------------- 频道表加载 ----------------
     def _scan(self, source):
@@ -1732,6 +1813,8 @@ class App(object):
         self.sel_done = set()
         self.sel_active = None
         self._paint_sel()
+        # 进度条归零；「全部」总数按所选表的**频道数**合计
+        self._pg_reset(items)
 
         # ---- 打开日志文件（与结果同目录、同主名）----
         self._open_log_file(out)
@@ -1851,19 +1934,40 @@ class App(object):
                     parts.append("OFFSET=%gkHz" % (round(float(ov) / 1000.0, 3)))
                 except (TypeError, ValueError):
                     parts.append("OFFSET=%s" % ov)
-            self._log("  [%3d] %-14s %9.3f MHz  LOCK=%-4s %s"
-                      % (row["idx"], row["ch"], float(row["freq_mhz"]),
+            # 频点序号带总数：`[  3/20]`，一眼看出还剩多少
+            # （总数未知时退化成 `[  3]`，不显示 `[3/0]` 这种误导性分母）
+            tag = ("[%3d/%d]" % (row["idx"], self.pg_cur_total)
+                   if self.pg_cur_total else "[%3d]" % row["idx"])
+            self._log("  %s %-14s %9.3f MHz  LOCK=%-4s %s"
+                      % (tag, row["ch"], float(row["freq_mhz"]),
                          row.get("LOCKED", "-"), "  ".join(parts)))
+            # 一个频点测完了 → 两条都前进一格
+            self.pg_cur_done += 1
+            self.pg_all_done += 1
+            self._update_progress()
         elif kind == TestEngine.MSG_PLAN_START:
             item = payload
             self.sel_active = item.key
+            # 换表了：本表进度归零、总数换成这张表的频点数
+            self.pg_cur_total = len(item.points())
+            self.pg_cur_done = 0
             self._paint_sel()
+            self._update_progress()
         elif kind == TestEngine.MSG_PLAN_DONE:
             item, rows = payload
             self.sel_done.add(item.key)
             if self.sel_active == item.key:
                 self.sel_active = None      # 这张测完了，等下一张的 START
             self._paint_sel()
+            # 补齐当前表：个别频点彻底失败（设置 NAK/超时）时不会发 MSG_ROW，
+            # 不补的话进度条会永远差一格，看着像卡住了。
+            # 每个频点最终**一定有结论**（成功写行 / 失败也在日志里落了记录），
+            # 所以这里补满是对语义的正确表达；差值同步补进「全部」。
+            missed = self.pg_cur_total - self.pg_cur_done
+            if missed > 0:
+                self.pg_cur_done = self.pg_cur_total
+                self.pg_all_done += missed
+            self._update_progress()
             self._log("【%s】完成，共 %d 个频道" % (item.name, len(rows)))
         elif kind == TestEngine.MSG_CONFIRM:
             self._confirm(payload)

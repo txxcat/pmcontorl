@@ -91,6 +91,20 @@ def settle(root, n=30, delay=0.05):
         time.sleep(delay)
 
 
+def demo_row(item, i):
+    """造一条 MSG_ROW 的 row（截图用演示数据，字段与真实结果行同构）"""
+    pts = item.points()
+    mhz, sig, ch, sr = pts[i - 1]
+    return {"idx": i, "band": item.band, "plan": item.name, "ch": ch,
+            "freq_mhz": "%.3f" % mhz, "signal": sig, "LOCKED": "ON",
+            "symb_rate": int(sr) if sr else "", "attempts": 1,
+            "LEVEL": "", "LEVEL_unit": "",
+            "CN": "21.5", "CN_unit": "dB",
+            "POWER": "68.2", "POWER_unit": "dBuV",
+            "MER": "32.1", "MER_unit": "dB",
+            "tune_s": 0.12, "wait_s": 0.3, "total_s": 0.45}
+
+
 def _collect_texts(w, acc):
     """递归收集控件上的文字（text / textvariable / Listbox 行）。"""
     for c in w.winfo_children():
@@ -238,17 +252,22 @@ def main(which=("main", "settings", "progress")):
             assert_no_local_user(root)          # 防线 4
             grab(win, os.path.join("docs", "screenshot-settings.png"), root)
 
-        # ---- 3) 「已选频道表」进度高亮（三种状态同框）----
+        # ---- 3) 「已选频道表」进度高亮 + 两条进度条（状态同框）----
         if "progress" in which:
             app._toggle_all()                   # 4 张演示表全勾上
             keys = list(app.check_vars.keys())
             it0, it1 = app._by_key(keys[0]), app._by_key(keys[1])
             app.sel_done, app.sel_active = set(), None
-            # 手工推一轮进度：第 1 张已测完（绿 ✓）、第 2 张正在测（琥珀 ▶）、后两张排队（白）
-            # 消息走的是与真实测试同一条路径（MSG_PLAN_START / MSG_PLAN_DONE）
+            # 用**真实消息**推一轮进度：第 1 张已测完（绿 ✓）、第 2 张正在测（琥珀 ▶）、
+            # 后两张排队（白）；进度条也随之走到"当前表 7/12、全部 9/22"。
+            app._pg_reset([app._by_key(k) for k in keys])
             app._handle(gui.TestEngine.MSG_PLAN_START, it0)
+            for i in range(1, len(it0.points()) + 1):
+                app._handle(gui.TestEngine.MSG_ROW, (it0, demo_row(it0, i)))
             app._handle(gui.TestEngine.MSG_PLAN_DONE, (it0, []))
             app._handle(gui.TestEngine.MSG_PLAN_START, it1)
+            for i in range(1, 8):           # 第 2 张停在 7/12，"正在测"的观感
+                app._handle(gui.TestEngine.MSG_ROW, (it1, demo_row(it1, i)))
             app.outdir_var.set(r"D:\Demo\Downloads")
             app.out_var.set(r"D:\Demo\Downloads\混合演示_DEMO_20261016.xlsx")
             settle(root, 40)

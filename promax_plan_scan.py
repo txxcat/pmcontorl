@@ -85,8 +85,8 @@ def scan_by_frequency(conn, inst, band, points, analog=True, lnb_output=0,
         khz = int(round(mhz * 1000))
         r = inst.set_tune(band, "%dK" % khz)
         if not r["ack"]:
-            print("  [%3d] %-12s %8.3f MHz  设置 NAK，跳过"
-                  % (i, chname, mhz))
+            print("  [%3d/%d] %-12s %8.3f MHz  设置 NAK，跳过"
+                  % (i, len(points), chname, mhz))
             continue
         if settle > 0:
             time.sleep(settle)
@@ -117,8 +117,8 @@ def scan_by_frequency(conn, inst, band, points, analog=True, lnb_output=0,
             row["OFFSET_unit"] = ou or "Hz"
         results.append(row)
 
-        print("  [%3d] %-12s %8.3f MHz  LOCK=%-4s %s%s"
-              % (i, chname, mhz, lock or "-",
+        print("  [%3d/%d] %-12s %8.3f MHz  LOCK=%-4s %s%s"
+              % (i, len(points), chname, mhz, lock or "-",
                  "  ".join("%s=%s%s" % (k, row.get(k, "-"), row.get(k + "_unit", ""))
                            for k in use_items),
                  ("  OFFSET=%sHz" % row["OFFSET"]) if row.get("OFFSET") else ""))
