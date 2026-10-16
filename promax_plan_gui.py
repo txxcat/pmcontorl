@@ -432,7 +432,9 @@ class TestEngine(object):
     def run_plan(self, item, settle=0.5, retry=3, retry_step=1.0):
         """跑完一张表。表级准备 + 频点循环分别见 _prepare_plan / _run_points。
 
-        断线不会中断本方法：_run_points 内部挂起等重连后重做当前频点。
+        断线不会中断本方法：**两个阶段都挂起等重连**
+          · 表级准备（_prepare_plan）—— 本方法内挂起，重连后重做整表准备
+          · 频点循环（_run_points）—— 内部挂起，重连后只重做当前频点
         """
         inst = Promax(self.conn)
         analog = item.signal_kind == "analog"
@@ -488,7 +490,25 @@ class TestEngine(object):
 
         # 表级准备（切频段 + 下发 LNB/profile + 校验 BAND）。
         # 断线重连后要重做同一套 → 抽成 _prepare_plan 供两处调用。
-        self._prepare_plan(inst, item, analog)
+        #
+        # 🔴 表级准备**也会撞上断线，必须在这里挂起重连**（踩过）。
+        #    以前这一句没保护，PromaxConnLost 直接抛到 run() 里被
+        #    `except PromaxError` 吃掉 → break → **整场测试提前结束**，
+        #    表现就是"设备断开后恢复，测试却没有继续，而是中断了"。
+        #    而"表边界"恰恰是断线高发点：用户正在换物理接口、仪器也可能
+        #    把空闲的 telnet 会话踢掉（单会话机型尤其明显）。
+        #    重连成功后**重做整张表的准备**（新 socket 上仪器侧配置未必还在）。
+        while True:
+            try:
+                self._prepare_plan(inst, item, analog)
+                break
+            except PromaxConnLost as e:
+                self.log("  [断线] 表级准备阶段连接丢失：%s" % e)
+                ok, inst = self._recover(item, analog, inst, str(e))
+                if not ok:
+                    self.log("  [中止] 测试已停止")
+                    return []
+                self.log("  连接已恢复，重做本表准备：%s" % item.name)
         return self._run_points(item, analog, inst, settle, retry, retry_step)
 
     def _prepare_plan(self, inst, item, analog):
@@ -504,20 +524,35 @@ class TestEngine(object):
         # 先把仪器切到目标频段，再做后续配置和校验。
         # 本程序按频率调谐（MODE=FREQ），频段由我们指定；
         # 如果先校验再切，仪器停在另一个频段时会误判成"测错频段"而中止。
-        inst.set_band(item.band)
+        r_band = inst.set_band(item.band)
         time.sleep(0.4)
 
         for line in inst.apply_profile(item.band, analog=analog,
                                        lnb_output=0):
             self.log("  " + line.strip())
 
-        inst.tune_mode("FREQ")
+        r_mode = inst.tune_mode("FREQ")
         # 切完之后再查一次：只有**仍不符**才中止
         # （防止 BAND 命令被静默忽略、实际用别的频段测出"看起来正常"的数据）。
         # 只查一次 —— 以前是每个频道都查，51 频道白多 51 条命令（约 25 秒）。
         # 注意：返回的 PLAN 与本程序无关（我们按频率调谐，实测 *TUNE PLAN= 恒 NAK，
         # 仪器里的表切不了），所以只用来校验 BAND，不写进结果。
-        b_now, p_now, _c = parse_tune_ch(inst.tune_ch())
+        ch_lines = inst.tune_ch()
+        b_now, p_now, _c = parse_tune_ch(ch_lines)
+
+        # 🔴 表级"静默无响应"也要当断线处理（踩过）。
+        #    半死的 WiFi 链路不会报 socket 错误，只会一直超时；此时三条表级
+        #    命令全超时、`?TUNE CH` 一个字都收不到。若不判，程序会**当成正常**
+        #    往下跑，白测好几个频点才在频点循环里攒够 3 次超时触发重连。
+        #    三条同时超时才判 —— 避免"仪器忙但还活着"被误判（那时 ?TUNE CH
+        #    一定答得上来）。
+        if (not ch_lines
+                and r_band.get("status") == "timeout"
+                and r_mode.get("status") == "timeout"):
+            raise PromaxConnLost(
+                "表级准备阶段仪器连续无响应（链路可能已断）",
+                kind="recv", host=self.host, port=self.port)
+
         # 只在**状态变化时**才打印：仪器的"当前加载表"远程改不了（*TUNE PLAN=
         # 恒 NAK），每张表都打一遍是纯噪音。BAND 变了才值得提一句。
         state = (b_now or "?", p_now or "?")
@@ -728,6 +763,26 @@ class TestEngine(object):
                     st, rt, stp = band_settings(self.cfg_run, item.band)
                     rows = self.run_plan(item, settle=st, retry=rt,
                                          retry_step=stp)
+                except PromaxConnLost as e:
+                    # 🔴 兜底网：run_plan 的**两个阶段**都已经自带挂起重连，
+                    #    正常到不了这里。留这一层是因为 PromaxConnLost 是
+                    #    PromaxError 的子类，一旦将来新增了没保护的仪器调用，
+                    #    就会掉进下面的 `except PromaxError` 直接 break ——
+                    #    那正是"设备断开后恢复、测试却中断了"这个坑。
+                    #    这里改成：先挂起把连接找回来，再重跑这张表。
+                    self.log("  [断线] %s" % e)
+                    ok, _ = self._recover(item, item.signal_kind == "analog",
+                                          Promax(self.conn), str(e))
+                    if not ok:
+                        self.log("  [中止] 测试已停止")
+                        break
+                    self.log("  连接已恢复，重跑本表：%s" % item.name)
+                    try:
+                        rows = self.run_plan(item, settle=st, retry=rt,
+                                             retry_step=stp)
+                    except PromaxError as e2:
+                        self.log("  [通讯异常] %s" % e2)
+                        break
                 except PromaxError as e:
                     self.log("  [通讯异常] %s" % e)
                     break

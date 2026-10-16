@@ -49,6 +49,7 @@
   python mock_promax_server.py --lock-ter 1.5        # 射频改成需连续等 1.5s
   python mock_promax_server.py --plan DEMO-C-Band    # 只加载指定表（可多次）
   python mock_promax_server.py --list-plans          # 列出可用表后退出
+  python mock_promax_server.py --drop-on-band 1      # 第 1 条 *TUNE BAND= 时断链
 
 🔴 锁定模型（默认）
   · 射频（TER）：0.15s → 客户端 settle_ter=0.3s 一次等待即锁 → **一次锁**
@@ -233,6 +234,13 @@ QUIET = False
 SLOW = 0.0
 SINGLE = False
 OPEN_COUNT = [0]
+
+# 断链注入（--drop-on-band N）：收到第 N 条 `*TUNE BAND=` 时**直接关闭连接**。
+# 用途：模拟"换表瞬间 / 表级准备阶段 WiFi 掉线"——这是断线最高发的时刻
+# （用户正在动线、仪器也可能把空闲 telnet 会话踢掉），用来验证客户端
+# 在**表级准备**阶段是否也会挂起重连、而不是把整场测试中断掉。
+DROP_ON_BAND = 0
+BAND_SEEN = 0
 
 
 def log(msg):
@@ -714,10 +722,24 @@ def handle(conn, addr):
 
 
 def respond(conn, line):
+    global BAND_SEEN
     cmd = line[1:]
     query = cmd.startswith("?")
     body = cmd[1:] if query else cmd
     log("  RX %r  %s" % (line, "(query)" if query else "(order)"))
+
+    # 断链注入：第 N 条 *TUNE BAND= 到达时直接断链（不给 ACK，模拟链路瞬断）
+    if DROP_ON_BAND and not query and body.upper().startswith("TUNE BAND"):
+        with LOCK:
+            BAND_SEEN += 1
+            seen = BAND_SEEN
+        if seen == DROP_ON_BAND:
+            log("  !! 注入断链：第 %d 条 *TUNE BAND= → 直接关闭连接" % seen)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
 
     if SLOW:
         time.sleep(SLOW)
@@ -782,12 +804,15 @@ def main():
                     help="每条响应额外延迟 N 秒（模拟真机响应慢）")
     ap.add_argument("--single", action="store_true",
                     help="只允许一个会话（复现真机单会话限制）")
+    ap.add_argument("--drop-on-band", type=int, default=0, metavar="N",
+                    help="收到第 N 条 *TUNE BAND= 时直接断链（模拟表级准备阶段掉线）")
     a = ap.parse_args()
 
     QUIET = a.quiet
     SLOW = a.slow
     SINGLE = a.single
     STATE.fail_first = a.fail_first
+    globals()["DROP_ON_BAND"] = a.drop_on_band
     # 锁定时间：分频段可调；--lock-time 作全局覆盖（旧参数兼容）
     if a.lock_time is not None:
         LOCK_TIME["TER"] = LOCK_TIME["SAT"] = a.lock_time
@@ -816,6 +841,9 @@ def main():
 
     if a.fail_first:
         print("注入：每频点前 %d 次测量返回 LOCKED=OFF" % a.fail_first)
+    if a.drop_on_band:
+        print("注入：第 %d 条 *TUNE BAND= 到达时直接断链（模拟表级准备掉线）"
+              % a.drop_on_band)
     print("锁定模型：调谐后**连续等待**够时间才 LOCKED=ON；重发 *TUNE 会重新计时")
     print("  射频 TER：需等待 %.2fs（客户端 settle_ter 即 0.3s → 一次锁）"
           % LOCK_TIME["TER"])

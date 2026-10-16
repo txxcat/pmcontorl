@@ -17,6 +17,17 @@
     python _test_reconnect.py                # 断网后**自动**重连（默认路径）
     python _test_reconnect.py --manual       # 关掉自动重连，测「重试连接」按钮路径
     python _test_reconnect.py --cold-start   # 开始时模拟器还没起（测"首连失败挂起"）
+    python _test_reconnect.py --boundary     # 🔴 断在**表级准备**阶段（换表瞬间掉线）
+
+⚠️ `--boundary` 场景（2026-10-16 补）
+    真机反馈："设备断开后恢复没有继续，而是中断了测试"。
+    根因：`run_plan()` 里的表级准备 `_prepare_plan()`（切频段 / 下发 LNB / 校验
+    BAND）**没有挂起重连**，而 `PromaxConnLost` 是 `PromaxError` 的子类 →
+    被 `run()` 的 `except PromaxError` 吃掉 → `break` → 整场测试提前结束。
+    表边界恰恰是断线高发点（用户正在动线、仪器也可能踢掉空闲会话），
+    所以这个洞一碰就中。
+    本场景用模拟器的 `--drop-on-band 1` 注入：第 1 条 `*TUNE BAND=` 直接断链，
+    断言测试**照常跑完**（FINISH + 全部频道都有结果）而不是中断。
 """
 import os
 import queue
@@ -35,6 +46,7 @@ PY = sys.executable
 
 MANUAL = "--manual" in sys.argv            # 关掉自动重连 → 只能靠"重试连接"按钮
 COLD_START = "--cold-start" in sys.argv     # 开始时模拟器没起（首连就失败）
+BOUNDARY = "--boundary" in sys.argv        # 断在表级准备阶段（换表瞬间掉线）
 
 OK = 0
 BAD = 0
@@ -50,17 +62,26 @@ def check(label, cond, extra=""):
         print("  [!! ] %s %s" % (label, extra))
 
 
-def start_mock():
-    return subprocess.Popen([PY, MOCK, "--quiet"],
+def start_mock(extra=None):
+    return subprocess.Popen([PY, MOCK, "--quiet"] + list(extra or []),
                             cwd=HERE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
 
 def main():
     global OK, BAD
-    print("模式：自动重连=%s  冷启动(首连就失败)=%s"
-          % ("否（手动按钮）" if MANUAL else "是", "是" if COLD_START else "否"))
-    mock = None if COLD_START else start_mock()
+    mode = []
+    if MANUAL:
+        mode.append("手动重连")
+    if COLD_START:
+        mode.append("冷启动")
+    if BOUNDARY:
+        mode.append("断在表级准备")
+    print("模式：%s" % ("、".join(mode) if mode else "自动重连"))
+    # 🔴 --boundary：模拟器自己不退出，只是在第 1 条 *TUNE BAND= 时把连接断掉，
+    #    所以"网络恢复"是天然发生的（重连即可）—— 这正对应真机的瞬断场景。
+    mock = None if COLD_START else start_mock(
+        ["--drop-on-band", "1"] if BOUNDARY else None)
     if COLD_START:
         print(">>> 模拟器暂不启动（模拟：点了开始但网络还没通）")
     time.sleep(1.2)
@@ -101,14 +122,17 @@ def main():
 
         if kind == TestEngine.MSG_ROW:
             rows_seen += 1
-            # 冷启动模式没有"中途断线"，全部频道一次跑完
-            if not COLD_START and rows_seen == 3 and killed_at is None:
+            # 冷启动 / 表边界场景没有"测到一半被杀掉"，全部频道一次跑完
+            if not COLD_START and not BOUNDARY and rows_seen == 3 \
+                    and killed_at is None:
                 killed_at = rows_seen
                 kill_mock_now = True
         elif kind == TestEngine.MSG_NETLOST:
             net_lost += 1
             print(">>> 已暂停：%s" % payload)
-            if not restarted:
+            if BOUNDARY:
+                print(">>> 模拟器进程仍在（只是把连接断了）→ 重连即可恢复")
+            elif not restarted:
                 time.sleep(1.5)             # 装成"网络恢复需要一点时间"
                 if COLD_START:
                     print(">>> 拉起模拟器（模拟网络恢复）")
@@ -161,6 +185,9 @@ def main():
     if COLD_START:
         check("首连失败也进入「已暂停」而不是直接结束", net_lost >= 1,
               "net_lost=%d" % net_lost)
+    elif BOUNDARY:
+        check("🔴 表级准备阶段断线也进入「已暂停」（曾直接中断整场测试）",
+              net_lost >= 1, "net_lost=%d" % net_lost)
     else:
         check("断线后收到「已暂停」（没有直接中断）", net_lost >= 1,
               "net_lost=%d" % net_lost)
@@ -172,6 +199,10 @@ def main():
     check("结果行数 == 表内频道数", final_rows is not None
           and len(final_rows) == n_total,
           "rows=%s total=%d" % (len(final_rows) if final_rows else None, n_total))
+    if BOUNDARY:
+        check("🔴 断线发生在**任何频道之前**（表级准备就断了，之后仍全部测到）",
+              rows_seen == n_total and (final_rows or []) and
+              len(final_rows) == n_total, "rows_seen=%d" % rows_seen)
     if final_rows:
         idxs = [r["idx"] for r in final_rows]
         check("序号连续无重复（未重测已完成的频道）",
