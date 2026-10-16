@@ -59,6 +59,12 @@ def _ts():
         (t % 1) * 1000)
 
 # --------------------------------------------------------------- 频道表模型
+# 「已选频道表」列表的进度配色：正在测 / 已完成 / 还没测
+SEL_ACTIVE_BG = "#ffd966"       # 琥珀：正在测试的这一张
+SEL_DONE_BG = "#d9f2d9"         # 浅绿：已测完
+SEL_IDLE_BG = "#ffffff"         # 白：排队中
+
+
 class PlanItem(object):
     """一个待测频道表"""
 
@@ -114,6 +120,7 @@ class TestEngine(object):
 
     MSG_LOG = "log"
     MSG_ROW = "row"
+    MSG_PLAN_START = "plan_start"   # 轮到某张表了（UI 据此高亮"已选频道表"里那行）
     MSG_PLAN_DONE = "plan_done"
     MSG_CONFIRM = "confirm"
     MSG_FINISH = "finish"
@@ -677,6 +684,9 @@ class TestEngine(object):
             for n, item in enumerate(items, 1):
                 if self._stop.is_set():
                     break
+                # 轮到这张表了 —— 放在「换线暂停」提示**之前**发：
+                # 暂停时右侧「已选频道表」就已经亮着这张，用户一眼知道该接哪个接口。
+                self.emit(self.MSG_PLAN_START, item)
                 if n > 1:
                     self.log("")
                     if pause_between:
@@ -916,6 +926,11 @@ class App(object):
         self.thread = None
         self.rows = {}             # 表名 -> [row]
         self.out_path = None
+        # 「已选频道表」列表的进度态：key 列表（按 Listbox 行序）+ 已完成集合
+        #   + 当前正在测的那张。三者一起决定每行的底色/前缀，见 _paint_sel()。
+        self.sel_box_keys = []     # Listbox 第 i 行 → 频道表 key
+        self.sel_done = set()      # 已测完的 key
+        self.sel_active = None     # 正在测试的 key（None = 没在测）
 
         root.title("PROMAX 频道表批量测试")
         w = self.cfg.get("window", {})
@@ -1026,8 +1041,14 @@ class App(object):
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
 
         ttk.Label(right, text="已选频道表").pack(anchor="w")
-        self.sel_box = tk.Listbox(right, height=10)
+        # selectmode="none"：这是个**展示**列表，不需要它自己的选中态 ——
+        # Tk Listbox 的选中行会用 selectbackground 盖掉 itemconfig 设的底色，
+        # 关掉选中态，"正在测试 / 已完成"的行底色才能稳定显示。
+        self.sel_box = tk.Listbox(right, height=10, selectmode="none",
+                                  activestyle="none")
         self.sel_box.pack(fill="both", expand=True, pady=4)
+        ttk.Label(right, text="▶ 正在测试    ✓ 已完成",
+                  foreground="#777").pack(anchor="w")
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", pady=4)
         bot = ttk.Frame(self.root, padding=8)
@@ -1110,12 +1131,41 @@ class App(object):
 
     def _sync_sel(self):
         keys = [k for k, v in self.check_vars.items() if v.get()]
+        self.sel_box_keys = keys
         self.sel_box.delete(0, "end")
-        for k in keys:
-            it = self._by_key(k)
-            self.sel_box.insert("end", it.label if it else k)
+        for _ in keys:
+            self.sel_box.insert("end", "")      # 文字由 _paint_sel 统一填
+        # ⚠️ sel_done **不清**：某张表已经测完了，用户把它取消勾选再勾回来，
+        #    它依然是"测过"的 —— 清掉会让人以为白跑一趟。
+        #    （新一轮测试开始时由 start() 统一重置。）
+        if self.sel_active not in keys:
+            self.sel_active = None
+        self._paint_sel()
         self.sel_lbl.set("已选 %d 个" % len(keys))
         self._auto_name(keys)
+
+    def _paint_sel(self):
+        """重绘「已选频道表」：标出正在测试的那张，已完成的行淡化。
+
+        配色：琥珀 = 正在测 / 浅绿 = 已完成 / 白 = 排队中。
+        另加 ▶ ✓ 前缀 —— 颜色之外再给一层区分，色弱用户也看得清。
+        """
+        for i, k in enumerate(self.sel_box_keys):
+            it = self._by_key(k)
+            text = it.label if it else k
+            if k == self.sel_active:
+                text, bg = "▶ " + text, SEL_ACTIVE_BG
+            elif k in self.sel_done:
+                text, bg = "✓ " + text, SEL_DONE_BG
+            else:
+                bg = SEL_IDLE_BG
+            # Listbox 没有"改某行文字"的方法，只能按行号删掉重插
+            self.sel_box.delete(i)
+            self.sel_box.insert(i, text)
+            self.sel_box.itemconfig(i, background=bg)
+        # 表多到列表装不下时，把正在测的那行滚进可视区
+        if self.sel_active in self.sel_box_keys:
+            self.sel_box.see(self.sel_box_keys.index(self.sel_active))
 
     def _auto_name(self, keys):
         """手动勾选时的默认文件名：单选用表名，多选用 SAT/TER+日期"""
@@ -1678,6 +1728,10 @@ class App(object):
             return
         self.out_path = out
         self.rows = {}
+        # 新一轮测试：清掉上一轮的进度标记（本轮高亮由 MSG_PLAN_START 驱动）
+        self.sel_done = set()
+        self.sel_active = None
+        self._paint_sel()
 
         # ---- 打开日志文件（与结果同目录、同主名）----
         self._open_log_file(out)
@@ -1800,8 +1854,16 @@ class App(object):
             self._log("  [%3d] %-14s %9.3f MHz  LOCK=%-4s %s"
                       % (row["idx"], row["ch"], float(row["freq_mhz"]),
                          row.get("LOCKED", "-"), "  ".join(parts)))
+        elif kind == TestEngine.MSG_PLAN_START:
+            item = payload
+            self.sel_active = item.key
+            self._paint_sel()
         elif kind == TestEngine.MSG_PLAN_DONE:
             item, rows = payload
+            self.sel_done.add(item.key)
+            if self.sel_active == item.key:
+                self.sel_active = None      # 这张测完了，等下一张的 START
+            self._paint_sel()
             self._log("【%s】完成，共 %d 个频道" % (item.name, len(rows)))
         elif kind == TestEngine.MSG_CONFIRM:
             self._confirm(payload)
@@ -2060,6 +2122,9 @@ class App(object):
     def _finish_ui(self):
         self.stop_btn.configure(state="disabled")
         self.retry_btn.configure(state="disabled")   # 测试结束
+        # 本轮跑完（或中止）：撤掉"正在测试"的高亮，已完成的行保留绿色
+        self.sel_active = None
+        self._paint_sel()
 
         # 断线统计：让用户一眼看到本次受过几次网络影响
         try:

@@ -4,13 +4,16 @@
   docs/pmcontorl_main.png         主界面（已应用演示预设）
   docs/screenshot-settings.png    设置界面
 
-🔴 两道防线，缺一不可：
+🔴 四道防线，缺一不可：
   1. monkeypatch load_config —— 界面会自己从磁盘读 plan_scan_gui.json，
      那里面有**真实仪器 IP** 与真实输出目录历史。
   2. 扫描**只含 DEMO-* 演示表的临时目录** —— 直接扫 CH/ 会把本地真实频道表
      （真实运营商表 / 真实卫星表名）列进界面并截进图里。
      真实表虽被 .gitignore 排除，**截图一公开就等于泄露**。（踩过）
-  另外还有第 3 道：截主界面前断言「所有表名都以 DEMO- 开头」，不满足直接报错退出。
+  3. 截主界面前断言「所有表名都以 DEMO- 开头」，不满足直接报错退出。
+  4. 截图前 `assert_no_local_user()` 扫界面上所有文字，
+     出现本机用户名（形如 `D:\\<用户名>\\Downloads`）就拒绝截图。
+     输出目录框默认读注册表的真实下载文件夹，只设文件名框拦不住。（踩过）
 """
 import os
 import shutil
@@ -88,6 +91,58 @@ def settle(root, n=30, delay=0.05):
         time.sleep(delay)
 
 
+def _collect_texts(w, acc):
+    """递归收集控件上的文字（text / textvariable / Listbox 行）。"""
+    for c in w.winfo_children():
+        try:
+            t = c.cget("text")
+            if t:
+                acc.append(str(t))
+        except Exception:
+            pass
+        try:
+            v = c.cget("textvariable")
+            if v:
+                try:
+                    val = c.getvar(v)
+                except Exception:
+                    val = ""
+                if val:
+                    acc.append(str(val))
+        except Exception:
+            pass
+        try:                        # Listbox / Text
+            if c.winfo_class() == "Listbox":
+                acc += [str(c.get(i)) for i in range(c.size())]
+            elif c.winfo_class() == "Text":
+                acc.append(str(c.get("1.0", "end")))
+        except Exception:
+            pass
+        _collect_texts(c, acc)
+    return acc
+
+
+def assert_no_local_user(root):
+    """防线 4：截图前扫界面上所有文字，出现**本机用户名**就拒绝截图。
+
+    ⚠️ 起因：`outdir_var` 默认走 `default_out_dir()` 从注册表读**真实下载文件夹**
+    （形如 `D:\\<本机用户名>\\Downloads`），只把文件名框设成演示值是拦不住的。
+    这种泄漏就是路径中间一段，人眼看图极易漏掉，所以交给断言把关。
+    """
+    import getpass
+    names = {n.lower() for n in (os.environ.get("USERNAME"),
+                                 getpass.getuser()) if n}
+    if not names:
+        return
+    hit = []
+    for t in _collect_texts(root, []):
+        if any(n in t.lower() for n in names):
+            hit.append(t)
+    hit = sorted(set(hit))
+    if hit:
+        raise SystemExit("!! 界面文字里出现本机用户名，拒绝截图：%s" % hit)
+
+
 _SCALE = [None]
 
 
@@ -142,8 +197,12 @@ try:
     # ---- 1) 主界面：应用一个演示预设，让界面有内容 ----
     app._apply_preset(app.cfg["presets"][0])
     # 输出路径用中性演示值（别把本机用户名 / 下载目录截进去）
+    # ⚠️ outdir_var 也必须设：它默认走注册表读**真实下载文件夹**
+    #   （形如 D:\<本机用户名>\Downloads），只设文件名框是不够的。（踩过）
+    app.outdir_var.set(r"D:\Demo\Downloads")
     app.out_var.set(r"D:\Demo\Downloads\射频数字_DEMO_20261015.xlsx")
     settle(root, 40)
+    assert_no_local_user(root)          # 防线 4
     grab(root, os.path.join("docs", "pmcontorl_main.png"), root)
 
     # ---- 2) 设置界面 ----
@@ -157,6 +216,7 @@ try:
     if win is None:
         root.destroy()
         raise SystemExit("!! 没找到设置窗")
+    assert_no_local_user(root)          # 防线 4
     grab(win, os.path.join("docs", "screenshot-settings.png"), root)
 
     root.destroy()
