@@ -162,7 +162,17 @@ def screen_scale(root):
 
 
 def grab(win, rel, root):
+    """抓窗口区域的截图。
+
+    🔴 必须先把窗口**提到最前**（lift + topmost + focus_force）：
+    `ImageGrab` 抓的是**屏幕**上那块矩形，不是窗口自身渲染的内容 ——
+    窗口被别的窗口盖住时会稳稳截到别人的界面（踩过）。
+    """
     from PIL import ImageGrab
+    win.update_idletasks()
+    win.lift()
+    win.attributes("-topmost", True)
+    win.focus_force()
     win.update_idletasks()
     win.update()
     time.sleep(0.6)
@@ -172,53 +182,83 @@ def grab(win, rel, root):
     w = int(win.winfo_width() * s)
     h = int(win.winfo_height() * s)
     img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+    win.attributes("-topmost", False)
     out = os.path.join(HERE, rel)
     img.save(out)
     print("saved %s  %s  (bbox=%d,%d,%dx%d)" % (out, img.size, x, y, w, h))
 
 
-demo_dir = demo_only_dir()
-try:
-    root = tk.Tk()
-    app = gui.App(root, demo_dir)
-    settle(root)
+def main(which=("main", "settings", "progress")):
+    """生成 README 用的界面截图。
 
-    # 防线 3：真要截图了，先确认扫描结果全是演示表
-    files = [it.file for it in app.items]
-    bad = [f for f in files if not f.startswith("DEMO-")]
-    if bad:
+    ⚠️ 必须放在 `if __name__ == "__main__"` 里执行：本模块的函数会被别的脚本
+    import 复用，顶层代码若直接跑，import 一下就把 docs/ 下的图静默重写了（踩过）。
+    """
+    demo_dir = demo_only_dir()
+    try:
+        root = tk.Tk()
+        app = gui.App(root, demo_dir)
+        settle(root)
+
+        # 防线 3：真要截图了，先确认扫描结果全是演示表
+        files = [it.file for it in app.items]
+        bad = [f for f in files if not f.startswith("DEMO-")]
+        if bad:
+            root.destroy()
+            raise SystemExit("!! 扫描到非演示表，拒绝截图（会泄露真实数据）：%s" % bad)
+        if not files:
+            root.destroy()
+            raise SystemExit("!! 没扫到任何演示表，检查 CH/ 下有没有 DEMO-*.XML")
+        print("扫描到的表：%s" % ", ".join(files))
+
+        # ---- 1) 主界面：应用一个演示预设，让界面有内容 ----
+        if "main" in which:
+            app._apply_preset(app.cfg["presets"][0])
+            # 输出路径用中性演示值（别把本机用户名 / 下载目录截进去）
+            # ⚠️ outdir_var 也必须设：它默认走注册表读**真实下载文件夹**
+            #   （形如 D:\<本机用户名>\Downloads），只设文件名框是不够的。（踩过）
+            app.outdir_var.set(r"D:\Demo\Downloads")
+            app.out_var.set(r"D:\Demo\Downloads\射频数字_DEMO_20261015.xlsx")
+            settle(root, 40)
+            assert_no_local_user(root)          # 防线 4
+            grab(root, os.path.join("docs", "pmcontorl_main.png"), root)
+
+        # ---- 2) 设置界面 ----
+        if "settings" in which:
+            app._open_settings()
+            settle(root, 40)
+
+            win = None
+            for w in root.winfo_children():
+                if isinstance(w, tk.Toplevel):
+                    win = w
+            if win is None:
+                root.destroy()
+                raise SystemExit("!! 没找到设置窗")
+            assert_no_local_user(root)          # 防线 4
+            grab(win, os.path.join("docs", "screenshot-settings.png"), root)
+
+        # ---- 3) 「已选频道表」进度高亮（三种状态同框）----
+        if "progress" in which:
+            app._toggle_all()                   # 4 张演示表全勾上
+            keys = list(app.check_vars.keys())
+            it0, it1 = app._by_key(keys[0]), app._by_key(keys[1])
+            app.sel_done, app.sel_active = set(), None
+            # 手工推一轮进度：第 1 张已测完（绿 ✓）、第 2 张正在测（琥珀 ▶）、后两张排队（白）
+            # 消息走的是与真实测试同一条路径（MSG_PLAN_START / MSG_PLAN_DONE）
+            app._handle(gui.TestEngine.MSG_PLAN_START, it0)
+            app._handle(gui.TestEngine.MSG_PLAN_DONE, (it0, []))
+            app._handle(gui.TestEngine.MSG_PLAN_START, it1)
+            app.outdir_var.set(r"D:\Demo\Downloads")
+            app.out_var.set(r"D:\Demo\Downloads\混合演示_DEMO_20261016.xlsx")
+            settle(root, 40)
+            assert_no_local_user(root)          # 防线 4
+            grab(root, os.path.join("docs", "screenshot-progress.png"), root)
+
         root.destroy()
-        raise SystemExit("!! 扫描到非演示表，拒绝截图（会泄露真实数据）：%s" % bad)
-    if not files:
-        root.destroy()
-        raise SystemExit("!! 没扫到任何演示表，检查 CH/ 下有没有 DEMO-*.XML")
-    print("扫描到的表：%s" % ", ".join(files))
+    finally:
+        shutil.rmtree(demo_dir, ignore_errors=True)
 
-    # ---- 1) 主界面：应用一个演示预设，让界面有内容 ----
-    app._apply_preset(app.cfg["presets"][0])
-    # 输出路径用中性演示值（别把本机用户名 / 下载目录截进去）
-    # ⚠️ outdir_var 也必须设：它默认走注册表读**真实下载文件夹**
-    #   （形如 D:\<本机用户名>\Downloads），只设文件名框是不够的。（踩过）
-    app.outdir_var.set(r"D:\Demo\Downloads")
-    app.out_var.set(r"D:\Demo\Downloads\射频数字_DEMO_20261015.xlsx")
-    settle(root, 40)
-    assert_no_local_user(root)          # 防线 4
-    grab(root, os.path.join("docs", "pmcontorl_main.png"), root)
 
-    # ---- 2) 设置界面 ----
-    app._open_settings()
-    settle(root, 40)
-
-    win = None
-    for w in root.winfo_children():
-        if isinstance(w, tk.Toplevel):
-            win = w
-    if win is None:
-        root.destroy()
-        raise SystemExit("!! 没找到设置窗")
-    assert_no_local_user(root)          # 防线 4
-    grab(win, os.path.join("docs", "screenshot-settings.png"), root)
-
-    root.destroy()
-finally:
-    shutil.rmtree(demo_dir, ignore_errors=True)
+if __name__ == "__main__":
+    main()
