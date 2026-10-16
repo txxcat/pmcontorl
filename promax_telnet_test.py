@@ -63,6 +63,31 @@ class PromaxError(Exception):
     """仪器通讯异常"""
 
 
+class PromaxConnLost(PromaxError):
+    """**连接丢失**（可恢复）—— 与"仪器在线但拒绝/超时"区分开。
+
+    仪器走 WiFi 时链路会抖（掉线、AP 重连、DHCP 续约）。这类故障的特点：
+      · 报错点一定在 socket 层（recv/send/select 抛 OSError，或 recv 返回 b'' 对端关闭）
+      · **重连之后可以继续**，不像 NAK 那样是业务拒绝
+
+    所以 GUI 侧对它的处理是"暂停测试 → 等网络恢复 → 重连 → 从当前频点重做"，
+    而 PromaxError（NAK/超时/频段不符）仍然按原来的方式中止或跳过。
+
+    kind 便于日志分类：
+      'send'   —— 发送命令时失败
+      'recv'   —— 读取响应时失败
+      'select' —— select 轮询失败（通常是网卡掉了）
+      'closed' —— 对端主动关闭（recv 返回 0）
+      'connect'—— 建连失败
+    """
+
+    def __init__(self, msg, kind="recv", host=None, port=None):
+        super(PromaxConnLost, self).__init__(msg)
+        self.kind = kind
+        self.host = host
+        self.port = port
+
+
 # ---------------------------------------------------------------- 频率解析
 _FREQ_RE = re.compile(
     r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kKmMgG]?)\s*(?:Hz)?\s*$"
@@ -288,10 +313,29 @@ class PromaxTelnet(object):
                 last = e
                 s.close()
         if self._sock is None:
-            raise PromaxError("无法连接 %s:%d — %s" % (self.host, self.port, last))
+            raise PromaxConnLost("无法连接 %s:%d — %s" % (self.host, self.port, last),
+                                 kind="connect", host=self.host, port=self.port)
         self._sock.setblocking(False)
         self._log("已连接 %s:%d" % (self.host, self.port))
         return self
+
+    def reconnect(self):
+        """关掉旧连接并重新建连（用于 WiFi 掉线后恢复）。
+
+        必须先把旧 socket 用 SO_LINGER RST 关掉：仪器只允许一个 telnet 会话，
+        网络抖动时仪器侧往往还挂着半死的旧会话，不发 RST 会让新连接
+        "连得上但收不到任何回复"（这个坑踩过多次，见 close() 的说明）。
+
+        同时重置全部解析状态（半截命令行 / IAC 协商状态 / 响应行缓冲），
+        否则残包会污染重连后的第一条响应。
+        """
+        self.close()
+        self._buf = bytearray()
+        self._lines = []
+        self._raw = bytearray()
+        self._iac = 0
+        self._iac_verb = 0
+        return self.connect()
 
     def close(self):
         """关闭连接。
@@ -345,26 +389,31 @@ class PromaxTelnet(object):
         恰恰依赖大量短超时轮询，必须走 select。
         """
         if self._sock is None:
-            raise PromaxError("连接未建立")
+            raise PromaxConnLost("连接未建立", kind="recv",
+                                 host=self.host, port=self.port)
         try:
             r, _, _ = select.select([self._sock], [], [], max(0.0, wait))
         except (OSError, ValueError) as e:
-            raise PromaxError("select 失败: %s" % e)
+            raise PromaxConnLost("select 失败: %s" % e, kind="select",
+                                 host=self.host, port=self.port)
         if not r:
             return b""
         try:
             chunk = self._sock.recv(4096)
         except OSError as e:
-            raise PromaxError("读取失败: %s" % e)
+            raise PromaxConnLost("读取失败: %s" % e, kind="recv",
+                                 host=self.host, port=self.port)
         return chunk if chunk else None
 
     def _send_raw(self, data):
         if self._sock is None:
-            raise PromaxError("连接未建立")
+            raise PromaxConnLost("连接未建立", kind="send",
+                                 host=self.host, port=self.port)
         try:
             self._sock.sendall(data)
         except OSError as e:
-            raise PromaxError("发送失败: %s" % e)
+            raise PromaxConnLost("发送失败: %s" % e, kind="send",
+                                 host=self.host, port=self.port)
         self._log("TX %r" % data)
 
     def _feed(self, chunk, events):
@@ -428,7 +477,8 @@ class PromaxTelnet(object):
                 break
             chunk = self._read_chunk(min(0.2, remain))
             if chunk is None:
-                raise PromaxError("仪器主动断开连接")
+                raise PromaxConnLost("仪器主动断开连接", kind="closed",
+                                     host=self.host, port=self.port)
             if chunk:
                 self._feed(chunk, events)
         return events
@@ -465,7 +515,8 @@ class PromaxTelnet(object):
                 break
             chunk = self._read_chunk(min(0.2, max(0.02, timeout - (now - start))))
             if chunk is None:
-                raise PromaxError("仪器主动断开连接")
+                raise PromaxConnLost("仪器主动断开连接", kind="closed",
+                                     host=self.host, port=self.port)
             if chunk:
                 before = len(self._lines)
                 self._feed(chunk, events)
@@ -497,7 +548,8 @@ class PromaxTelnet(object):
                 break
             chunk = self._read_chunk(min(0.2, remain))
             if chunk is None:
-                raise PromaxError("仪器主动断开连接")
+                raise PromaxConnLost("仪器主动断开连接", kind="closed",
+                                     host=self.host, port=self.port)
             if chunk:
                 self._feed(chunk, events)
         return events

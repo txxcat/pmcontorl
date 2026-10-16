@@ -68,6 +68,13 @@ DEFAULT_CONFIG = {
     "retry_step_ter": 0.3,      # 射频每次重试增加的稳定等待（秒）
     "retry_step_sat": 6.0,      # 卫星每次重试增加的稳定等待（秒）
     "pause_between": True,      # 手动多选时，表间是否暂停（默认暂停）
+    # ---- 断线自动重连 ----
+    # 仪器走 WiFi 时链路会抖（掉线 / AP 重连 / DHCP 续约）。断线后**不中断测试**：
+    # 暂停 → 等重连 → 从当前频点继续（已测完的不重测）。
+    # auto_reconnect=True 时定时自动重试，网络恢复后无需人工干预即可续跑；
+    # 关掉后仍可点界面上的「重试连接」手动重试。
+    "auto_reconnect": True,
+    "reconnect_interval": 10.0,   # 自动重连间隔（秒），下限 2
     # 结果文件格式：xlsx（带表头样式）/ csv（通用，Excel 可直接打开）
     "export_format": "xlsx",
     # ---- 日志 ----

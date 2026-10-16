@@ -16,6 +16,9 @@
 - **频道表批量测试**：射频（TER）/ 卫星（SAT）分两组展示，可单选、可跨组多选
 - **快捷测试组**：一键选中一组频道表并按规则生成结果文件名（配置驱动，可自定义）
 - **自动锁定重试**：未锁定时保持同频继续等待，逐步加大稳定等待时间
+- **断线自动重连**（仪器走 WiFi 时链路会抖）：连接断开时测试**暂停**而不是中断，
+  自动重连（间隔可配，默认 10s）并从**当前频点**继续；已测完的频点不会重测。
+  也可以点工具栏的「重试连接」按钮立即重试，或点「中止」结束并保存已测数据。
 - **结果导出**：xlsx（带表头样式）/ csv（utf-8-sig，Excel 直开），设置里可切
 - **按频段裁剪结果列**（实测口径，避免无意义空列）：
   | 测试类型 | 列数 | 不输出 |
@@ -62,9 +65,10 @@ python promax_plan_gui.py               # IP 保持 127.0.0.1 即可
 
 - `*TUNE PLAN=` 恒 NAK、`LNB OUTPUT=0` NAK、`SIGNAL STANDARD=DK` NAK
 - 锁定只由**等待时间**决定；**重发 `*TUNE` 会重置捕获导致永远锁不上**
-- 个别卫星频道按实测注入慢锁（前 N 次测量报 `LOCKED=OFF`），见 `mock_promax_server.py`
-  里的 `SLOW_LOCK` 表（键为「频段 + 中频 MHz」）。表里同时包含
-  「DEMO 演示组」（对应仓库自带的 `DEMO-C-Band`）和「现场实测组」——
+- **锁定时间按频段给**：射频 0.15s（客户端一次等待就锁）、卫星基线 2.0s（一次锁），
+  **个别卫星频道**按 `SLOW_LOCK` 表要 8~16s → 触发客户端的锁定重试
+  （`SLOW_LOCK` 的值 = **该频道需要的连续等待秒数**，键为「频段 + 中频 MHz」）。
+  表里同时包含「DEMO 演示组」（对应仓库自带的 `DEMO-C-Band`）和「现场实测组」——
   后者是按作者仪器标定的，**用自己机器的频道表时请改成你实测到的中频**。
 - 模拟制式永不报 `LOCKED=ON`，只返回 `LEVEL`
 
@@ -73,6 +77,9 @@ python promax_plan_gui.py               # IP 保持 127.0.0.1 即可
 ```bash
 python _selftest_mock.py          # 协议级自检（40 项）
 python _e2e_mock.py DEMO-C-Band.XML   # 端到端跑指定频道表
+python _test_reconnect.py         # 断线恢复：跑到一半杀掉模拟器，验证暂停→重连→续跑
+python _test_reconnect.py --manual      # 同上，但关掉自动重连，只走「重试连接」按钮
+python _test_reconnect.py --cold-start  # 开始时模拟器没起（验证首连失败也能挂起重试）
 ```
 
 ## 关于频道表数据
@@ -103,6 +110,8 @@ CH/
 | `mock_promax_server.py` | 仪器模拟器 |
 | `_selftest_mock.py` | 协议级自检（对模拟器跑） |
 | `_e2e_mock.py` | 端到端测试 |
+| `_test_reconnect.py` | 断线恢复测试（暂停 / 重连 / 续跑） |
+| `_shot_settings.py` | 生成 README 用的设置界面截图（用演示配置，不含真实数据） |
 | `CH/TER`, `CH/SAT` | 频道表目录（仅 DEMO-\* 入库） |
 
 ## ⚠️ 真机协议踩坑记录

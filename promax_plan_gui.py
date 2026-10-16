@@ -48,7 +48,8 @@ from promax_gui_config import (CONFIG_NAME, band_settings, date6, date8,
                                preset_pause, presets, save_config)
 from promax_plan_dump import load_plans, parse_plan_xml
 from promax_telnet_test import (PromaxTelnet, Promax, PromaxError,
-                                parse_measure_all, parse_tune_ch)
+                                PromaxConnLost, parse_measure_all,
+                                parse_tune_ch)
 
 
 def _ts():
@@ -117,6 +118,10 @@ class TestEngine(object):
     MSG_CONFIRM = "confirm"
     MSG_FINISH = "finish"
     MSG_STOPPED = "stopped"
+    # 🔴 断线相关：仪器走 WiFi 时链路会抖。断线**不中止测试**，而是挂起等重连，
+    #    网络恢复后从当前频点继续（已测完的频点不重测）。
+    MSG_NETLOST = "net_lost"     # 连接丢失，已暂停，等用户点「重试连接」或自动重连
+    MSG_NETOK = "net_ok"         # 重连成功，继续测试
 
     def __init__(self, out_q, port=2222):
         self.out = out_q
@@ -126,10 +131,23 @@ class TestEngine(object):
         self._ack = threading.Event()
         self._ack_val = None
         self.conn = None
+        # 断线恢复：UI 点「重试连接」时 set，引擎线程被唤醒去重连
+        self._retry_evt = threading.Event()
+        self._net_lost = False
+        self.timeout_run = 20.0
+        # 每个频点当前的制式 / (制式,符号率) 缓存，仅在制式变化时才重发设置
+        self._cur = {"sig": None, "sat": None}
+        # 重连统计（最后一次测试的累计次数，用于日志与 UI 展示）
+        self.reconnects = 0
 
     def stop(self):
         self._stop.set()
         self._ack.set()
+        self._retry_evt.set()       # 唤醒可能在等重连的循环，让它尽快看到 _stop
+
+    def retry_connect(self):
+        """UI 线程调用：立刻尝试一次重连（不等自动重连的轮询间隔）。"""
+        self._retry_evt.set()
 
     def emit(self, kind, payload=None):
         self.out.put((kind, payload))
@@ -158,6 +176,112 @@ class TestEngine(object):
             except Exception:
                 pass
             self.conn = None
+
+    # ---- 断线恢复（WiFi 抖动 → 暂停 → 重连 → 从当前频点继续）----
+    def _wait_reconnect(self, reason=""):
+        """断线后挂起：等「重试连接」按钮或自动轮询，直到重连成功。
+
+        返回 True = 已重连（调用方应**重做当前频点**）；False = 用户中止。
+
+        设计要点
+        --------
+        · **不丢已测数据**：只负责把连接弄回来；已完成的 rows 由调用方保留，
+          重连后从**当前频点**继续，不从头重测。
+        · **手动 + 自动**：默认每 reconnect_interval 秒自动试一次（设置里可关）；
+          用户点「重试连接」立刻插队试一次。WiFi 恢复后即使没人盯也能自愈。
+        · **重连必须预检**：TCP 连上≠仪器接受命令。仪器只允许一个 telnet 会话，
+          掉线时仪器侧常挂着半死会话 → "连得上但收不到 ACK"。
+          所以每次重连都发 *?VER 验证，不通就继续等（不误判成"已恢复"）。
+        """
+        self._net_lost = True
+        self.emit(self.MSG_NETLOST, reason)
+        self._retry_evt.clear()          # 清掉等待期间可能被点下的旧信号
+
+        auto = bool(self.cfg_run.get("auto_reconnect", True))
+        try:
+            interval = max(2.0, float(self.cfg_run.get("reconnect_interval", 10.0)))
+        except (TypeError, ValueError):
+            interval = 10.0
+        last_auto = time.time()          # 刚断线先留点时间，不立刻刷屏
+        tries = 0
+
+        while True:
+            if self._stop.is_set():
+                self._net_lost = False
+                return False
+            manual = self._retry_evt.wait(0.5)
+            if manual:
+                self._retry_evt.clear()
+            else:
+                if not (auto and (time.time() - last_auto) >= interval):
+                    continue
+                last_auto = time.time()
+
+            tries += 1
+            self.log("  [重连] 第 %d 次尝试（%s）..."
+                     % (tries, "手动" if manual else "自动"))
+            try:
+                self.conn.reconnect()    # 内部先 SO_LINGER RST 关旧连接再重连
+            except PromaxConnLost as e:
+                self.log("  [重连] 失败：%s" % e)
+                continue
+            except Exception as e:       # 兜底：重连本身出错不该把测试打崩
+                self.log("  [重连] 异常：%r" % e)
+                continue
+
+            try:                          # 预检：TCP 通了还要仪器真的应答
+                pv = self.conn.command("?VER", timeout=min(self.timeout_run, 10.0))
+            except PromaxConnLost as e:
+                self.log("  [重连] 预检失败：%s" % e)
+                continue
+            if pv.get("status") != "ack":
+                self.log("  [重连] TCP 已连接但仪器无应答（%s）——"
+                         "旧会话可能还没释放，稍后自动再试" % pv.get("status"))
+                continue
+
+            self.reconnects += 1
+            self.log("  [重连] 成功（第 %d 次）：仪器应答 %s"
+                     % (tries, pv["lines"][0] if pv["lines"] else "OK"))
+            self._net_lost = False
+            self.emit(self.MSG_NETOK, tries)
+            return True
+
+    def _connect_and_probe(self):
+        """建连 + 预检（*?VER）；失败**不放弃**，挂起等重连。
+
+        返回 True = 已连上且仪器应答；False = 用户中止。
+
+        ⚠️ 复用 _wait_reconnect()：它内部就是"重连 + *?VER 预检"，
+        所以**首连失败**与**中途断线**走同一套恢复逻辑，行为一致。
+        """
+        try:
+            self.log("连接 %s ..." % self.host)
+            self.conn.connect()
+            # 预检：TCP 连上不代表仪器接受命令（单会话被占/忙/前面板界面都会
+            # 导致"连得上但收不到 ACK"）。先发一条 ?VER 探活。
+            pv = self.conn.command("?VER", timeout=min(self.timeout_run, 10.0))
+            if pv.get("status") == "ack":
+                self.log("   仪器应答：%s"
+                         % (pv["lines"][0] if pv["lines"] else "OK"))
+                return True
+            self.log("")
+            self.log("!! 仪器没有应答（%s）" % pv.get("status"))
+            self.log("   TCP 已连上，但命令发不出去。常见原因：")
+            self.log("   1. 仪器只允许一个 telnet 会话，上一个会话没干净断开")
+            self.log("      → 等 1~2 分钟，或在仪器上断开远程控制")
+            self.log("   2. 仪器正忙（正在测量/扫描/捕获）")
+            self.log("   3. 前面板停在需要确认的界面 → 回到主界面")
+            self.log("   4. telnet 服务被关 → Preferences → Network 重新开启")
+            self.log("   可用浏览器打开 http://%s/ 看仪器是否活着" % self.host)
+            self.log("")
+            self.log("已暂停：仪器恢复后会自动重连继续；"
+                     "也可点「重试连接」立即重试。")
+            return self._wait_reconnect("仪器无应答（%s）" % pv.get("status"))
+        except PromaxConnLost as e:
+            self.log("连接失败: %s" % e)
+            self.log("已暂停：等仪器 / 网络恢复。默认会定时自动重连，"
+                     "也可点「重试连接」立即重试，或点「中止」结束。")
+            return self._wait_reconnect(str(e))
 
     # ---- 单张表 ----
     def _tune_and_measure(self, inst, item, mhz, chname, idx,
@@ -203,13 +327,18 @@ class TestEngine(object):
                     if st == "timeout":
                         self.no_resp += 1
                         if self.no_resp >= 3:
-                            raise PromaxError(
-                                "连续 %d 条命令仪器无响应，已停止。\n"
-                                "请检查：① 仪器是否忙（正在测量/扫描）\n"
-                                "② 是否已有其他 telnet 会话占用\n"
-                                "③ 前面板是否停在需要确认的界面\n"
-                                "④ 用 --diag 或浏览器 http://%s/ 确认仪器状态"
-                                % (self.no_resp, self.host or "<仪器IP>"))
+                            # 🔴 归为「连接丢失」而不是普通业务错误：连得上但连续
+                            # 无响应，几乎都是链路半死（WiFi 掉包 / 旧会话没释放）。
+                            # 抛 PromaxConnLost → 上层挂起等重连，网络好了接着测。
+                            raise PromaxConnLost(
+                                "连续 %d 条命令仪器无响应（链路可能已断）。\n"
+                                "已暂停测试，等网络/仪器恢复后会自动重连继续；\n"
+                                "也可点「重试连接」立即重试，或点「中止」结束。\n"
+                                "排查：① 仪器是否忙 ② 是否被别的 telnet 会话占用\n"
+                                "③ 前面板是否停在需确认的界面 ④ 浏览器打开 "
+                                "http://%s/ 看仪器是否活着"
+                                % (self.no_resp, self.host or "<仪器IP>"),
+                                kind="recv", host=self.host, port=self.port)
                     else:
                         self.no_resp = 0
                     return None, attempts
@@ -282,10 +411,11 @@ class TestEngine(object):
         return False
 
     def run_plan(self, item, settle=0.5, retry=3, retry_step=1.0):
-        conn = self.conn
-        inst = Promax(conn)
-        rows = []
+        """跑完一张表。表级准备 + 频点循环分别见 _prepare_plan / _run_points。
 
+        断线不会中断本方法：_run_points 内部挂起等重连后重做当前频点。
+        """
+        inst = Promax(self.conn)
         analog = item.signal_kind == "analog"
         if item.band == "SAT":
             srs = [p[3] for p in item.points() if p[3]]
@@ -337,6 +467,21 @@ class TestEngine(object):
                     self.log("         %-14s 表值=%.3f MHz → 实际调谐=%.3f MHz"
                              % (nm, plan_f, tune_f))
 
+        # 表级准备（切频段 + 下发 LNB/profile + 校验 BAND）。
+        # 断线重连后要重做同一套 → 抽成 _prepare_plan 供两处调用。
+        self._prepare_plan(inst, item, analog)
+        return self._run_points(item, analog, inst, settle, retry, retry_step)
+
+    def _prepare_plan(self, inst, item, analog):
+        """表级准备：切频段 → 下发 LNB/profile → 设 FREQ 模式 → 校验频段。
+
+        🔴 抽成独立方法的理由：**断线重连后必须重做这一整套**。
+        重连是新 socket，仪器侧的解调/输入配置未必还在（也可能被重置），
+        只重发 *TUNE 是不够的。调用方在重连成功后重新调用本方法做 resync。
+
+        只在 BAND 真正不符时抛 PromaxError（避免误测成别的频段）；
+        链路类故障会抛 PromaxConnLost，由调用方挂起等重连。
+        """
         # 先把仪器切到目标频段，再做后续配置和校验。
         # 本程序按频率调谐（MODE=FREQ），频段由我们指定；
         # 如果先校验再切，仪器停在另一个频段时会误判成"测错频段"而中止。
@@ -344,7 +489,7 @@ class TestEngine(object):
         time.sleep(0.4)
 
         for line in inst.apply_profile(item.band, analog=analog,
-                                            lnb_output=0):
+                                       lnb_output=0):
             self.log("  " + line.strip())
 
         inst.tune_mode("FREQ")
@@ -366,96 +511,148 @@ class TestEngine(object):
                 "已下发 *TUNE BAND=%s，但仪器仍停在 BAND=%s，已中止"
                 "（避免误测成别的频段）" % (item.band, b_now))
 
-        cur_sig = None
-        cur_sat = None          # (制式, 符号率) —— 卫星每频点可能不同
-        pts = item.points()
-        self.no_resp = 0        # 连续无响应计数，达到阈值就停
+    # ---- 频点循环（含"断线挂起 → 重连 → 重做当前频点"）----
+    def _run_points(self, item, analog, inst, settle, retry, retry_step):
+        """逐个频点测试；**断线时挂起等重连，然后重做当前频点**。
 
-        # ---- 逐个频点：设解调参数 + 设频率 + 锁定重试 + 组装结果 ----
-        for i, (mhz, sig, chname, sr) in enumerate(pts, 1):
+        🔴 这是"WiFi 断网不中断测试"的核心：
+          · 断线（PromaxConnLost）不 break，而是 _recover() 挂起等重连
+          · 重连成功后重新下发表级配置（仪表侧配置可能丢）+ 重做当前频点
+          · 已测完的频点保留在 rows 里，**不重测**
+          · 用户点「中止」→ _recover 返回 False → 干净退出
+        """
+        self._cur = {"sig": None, "sat": None}   # 制式缓存（本表内有效）
+        self.no_resp = 0        # 连续无响应计数，达到阈值就按断线处理
+        pts = item.points()
+        rows = []
+        i = 0
+        while i < len(pts):
             if self._stop.is_set():
                 self.log("  [中止] 用户停止测试")
                 break
-            want = "ANALOG" if str(sig).upper().startswith("ANALOG") else (
-                "DVB-C" if item.band == "TER" else "DVB-S2")
-            if item.band == "SAT":
-                # 卫星：符号率/制式每个频点可能不同，**变了就必须重设**。
-                # 不设对符号率会锁不上（实测某频道在 SR=21370k 时 LOCKED=OFF，
-                # 改成表载 9200k 后 LOCKED=ON）。
-                key = (str(sig).upper(), sr)
-                if key != cur_sat:
-                    for label, r in inst.set_sat_params(sig, sr):
-                        st = r.get("status", "ack" if r["ack"] else "nak")
-                        mark = {"ack": "ACK", "nak": "NAK",
-                                "timeout": "无响应(超时)"}.get(st, st)
-                        self.log("    设置 %-20s -> %s" % (label, mark))
-                    cur_sat = key
-                    cur_sig = want        # 制式已随参数设好
-                    time.sleep(0.5)
-            elif want != cur_sig:
-                inst.signal_type(want)
-                if want == "ANALOG":
-                    inst.signal_standard("PAL")
-                cur_sig = want
-                time.sleep(0.3)
-
-            m, attempts = self._tune_and_measure(
-                inst, item, mhz, chname, i, settle, retry, retry_step,
-                # 模拟制式不要求锁定（连续载波，仪器不报 LOCKED=ON），
-                # 但有电平读数就算成功 —— 否则会白重试且丢掉 LEVEL/CN
-                require_lock=(want != "ANALOG"))
-            if m is None:
+            mhz, sig, chname, sr = pts[i]
+            i += 1
+            try:
+                row = self._one_point(item, analog, inst, mhz, sig, chname, sr,
+                                      i, settle, retry, retry_step)
+            except PromaxConnLost as e:
+                self.log("  [断线] %s" % e)
+                ok, inst = self._recover(item, analog, inst, str(e))
+                if not ok:
+                    self.log("  [中止] 测试已停止")
+                    break
+                self.log("  从第 %d/%d 个频点继续（此前已完成 %d 个，不回退重测）"
+                         % (i, len(pts), len(rows)))
+                i -= 1          # 当前频点只测了一半 → 回退一格重做
                 continue
-            allv, lock = m["allv"], m["lock"]
-
-            # 测量项：真机响应里没有 LEVEL 键，模拟电平在 POWER/CH_POWER 上
-            #（`*?MEASURE` 全量返回 POWER=68.26 dBuV CH_POWER=68.26 dBuV CN=...）
-            # 所以"LEVEL"显示项实际取 POWER，避免取空值。
-            if want == "ANALOG" and item.band == "TER":
-                use = ["LEVEL", "CN"]       # LEVEL → 取 POWER 键
-            elif item.band == "TER":
-                use = ["POWER", "MER"]
-            else:
-                use = ["POWER", "CN", "MER"]
-            row = {"idx": i, "band": item.band,
-                   # plan 列固定写「正在测的这张表」。
-                   # 仪器那边 *?TUNE CH 返回的 PLAN 与本程序无关：
-                   # 我们是按频率调谐（MODE=FREQ），且实测 *TUNE PLAN= 恒 NAK，
-                   # 仪器里的表根本切不了 —— 用它会让整列都是同一张表，误导。
-                   "plan": item.name,
-                   "ch": chname, "freq_mhz": "%.3f" % mhz,
-                   "signal": sig, "LOCKED": lock,
-                   "symb_rate": (int(sr) if sr else ""),
-                   "attempts": attempts,
-                   # 📊 耗时（秒）：调谐 / 累计等待 / 总计
-                   "tune_s": round(m.get("tune_s", 0.0), 3),
-                   "wait_s": round(m.get("wait_s", 0.0), 3),
-                   "total_s": round(m.get("total_s", 0.0), 3)}
-            # 频点耗时日志：一眼看出哪些频点接近锁定边界
-            if self.cfg_run.get("log_timing", True):
-                self.log("  [%3d] %-14s %9.3f MHz  LOCK=%-4s  调谐=%.2fs "
-                         "等待=%.1fs  总计=%.1fs  (尝试 %d 次)"
-                         % (i, chname, mhz, lock, row["tune_s"], row["wait_s"],
-                            row["total_s"], attempts))
-            # 显示键名 → 真机响应里的实际键名。
-            # 真机模拟制式(ANALOG)直接返回 LEVEL；数字制式没有 LEVEL，
-            # 模拟电平落在 POWER / CH_POWER 上。
-            # 所以**先按原名取，取不到再按映射名取**，两边都兼容。
-            KEYMAP = {"LEVEL": "POWER"}
-            for k in use:
-                v, u = allv.get(k, (None, ""))
-                if v is None:
-                    v, u = allv.get(KEYMAP.get(k, k), (None, ""))
-                row[k] = "" if v is None else v
-                row[k + "_unit"] = u or ""
-            if item.band == "SAT":
-                ov, ou = allv.get("OFFSET", (None, ""))
-                row["OFFSET"] = "" if ov is None else ov
-                row["OFFSET_unit"] = ou or "Hz"
-            rows.append(row)
-            self.emit(self.MSG_ROW, (item, row))
-
+            if row is not None:
+                rows.append(row)
+                self.emit(self.MSG_ROW, (item, row))
         return rows
+
+    def _recover(self, item, analog, inst, reason):
+        """断线恢复：挂起等重连 → 重新下发表级配置。
+
+        返回 (是否继续, 新的 inst)。中途再断会再次挂起（WiFi 抖动可能反复），
+        只有用户点「中止」才返回 (False, inst)。
+        """
+        while True:
+            if not self._wait_reconnect(reason):
+                return False, inst
+            inst = Promax(self.conn)      # 重连后 self.conn 是新的 socket
+            self.no_resp = 0
+            self.log("  重连成功，重新下发频段 / LNB 配置...")
+            try:
+                self._prepare_plan(inst, item, analog)
+                return True, inst
+            except PromaxConnLost as e:   # 刚回来又抖掉 → 再挂起一次
+                self.log("  [断线] 配置阶段又断开：%s" % e)
+                reason = str(e)
+
+    def _one_point(self, item, analog, inst, mhz, sig, chname, sr, idx,
+                   settle, retry, retry_step):
+        """测一个频点：按需切换制式/符号率 → 调谐 + 等锁定（含重试）→ 组装 row。
+
+        返回 row；设置阶段彻底失败返回 None。
+        网络故障抛 PromaxConnLost，由 _run_points 挂起重连后**重做本频点**。
+        """
+        want = "ANALOG" if str(sig).upper().startswith("ANALOG") else (
+            "DVB-C" if item.band == "TER" else "DVB-S2")
+        if item.band == "SAT":
+            # 卫星：符号率/制式每个频点可能不同，**变了就必须重设**。
+            # 不设对符号率会锁不上（实测某频道在 SR=21370k 时 LOCKED=OFF，
+            # 改成表载 9200k 后 LOCKED=ON）。
+            key = (str(sig).upper(), sr)
+            if key != self._cur["sat"]:
+                for label, r in inst.set_sat_params(sig, sr):
+                    st = r.get("status", "ack" if r["ack"] else "nak")
+                    mark = {"ack": "ACK", "nak": "NAK",
+                            "timeout": "无响应(超时)"}.get(st, st)
+                    self.log("    设置 %-20s -> %s" % (label, mark))
+                self._cur["sat"] = key
+                self._cur["sig"] = want        # 制式已随参数设好
+                time.sleep(0.5)
+        elif want != self._cur["sig"]:
+            inst.signal_type(want)
+            if want == "ANALOG":
+                inst.signal_standard("PAL")
+            self._cur["sig"] = want
+            time.sleep(0.3)
+
+        m, attempts = self._tune_and_measure(
+            inst, item, mhz, chname, idx, settle, retry, retry_step,
+            # 模拟制式不要求锁定（连续载波，仪器不报 LOCKED=ON），
+            # 但有电平读数就算成功 —— 否则会白重试且丢掉 LEVEL/CN
+            require_lock=(want != "ANALOG"))
+        if m is None:
+            return None
+        allv, lock = m["allv"], m["lock"]
+
+        # 测量项：真机响应里没有 LEVEL 键，模拟电平在 POWER/CH_POWER 上
+        #（`*?MEASURE` 全量返回 POWER=68.26 dBuV CH_POWER=68.26 dBuV CN=...）
+        # 所以"LEVEL"显示项实际取 POWER，避免取空值。
+        if want == "ANALOG" and item.band == "TER":
+            use = ["LEVEL", "CN"]       # LEVEL → 取 POWER 键
+        elif item.band == "TER":
+            use = ["POWER", "MER"]
+        else:
+            use = ["POWER", "CN", "MER"]
+        row = {"idx": idx, "band": item.band,
+               # plan 列固定写「正在测的这张表」。
+               # 仪器那边 *?TUNE CH 返回的 PLAN 与本程序无关：
+               # 我们是按频率调谐（MODE=FREQ），且实测 *TUNE PLAN= 恒 NAK，
+               # 仪器里的表根本切不了 —— 用它会让整列都是同一张表，误导。
+               "plan": item.name,
+               "ch": chname, "freq_mhz": "%.3f" % mhz,
+               "signal": sig, "LOCKED": lock,
+               "symb_rate": (int(sr) if sr else ""),
+               "attempts": attempts,
+               # 📊 耗时（秒）：调谐 / 累计等待 / 总计
+               "tune_s": round(m.get("tune_s", 0.0), 3),
+               "wait_s": round(m.get("wait_s", 0.0), 3),
+               "total_s": round(m.get("total_s", 0.0), 3)}
+        # 频点耗时日志：一眼看出哪些频点接近锁定边界
+        if self.cfg_run.get("log_timing", True):
+            self.log("  [%3d] %-14s %9.3f MHz  LOCK=%-4s  调谐=%.2fs "
+                     "等待=%.1fs  总计=%.1fs  (尝试 %d 次)"
+                     % (idx, chname, mhz, lock, row["tune_s"], row["wait_s"],
+                        row["total_s"], attempts))
+        # 显示键名 → 真机响应里的实际键名。
+        # 真机模拟制式(ANALOG)直接返回 LEVEL；数字制式没有 LEVEL，
+        # 模拟电平落在 POWER / CH_POWER 上。
+        # 所以**先按原名取，取不到再按映射名取**，两边都兼容。
+        KEYMAP = {"LEVEL": "POWER"}
+        for k in use:
+            v, u = allv.get(k, (None, ""))
+            if v is None:
+                v, u = allv.get(KEYMAP.get(k, k), (None, ""))
+            row[k] = "" if v is None else v
+            row[k + "_unit"] = u or ""
+        if item.band == "SAT":
+            ov, ou = allv.get("OFFSET", (None, ""))
+            row["OFFSET"] = "" if ov is None else ov
+            row["OFFSET_unit"] = ou or "Hz"
+        return row
 
     def run(self, host, items, cfg=None, timeout=20.0, pause_between=True):
         self.host = host
@@ -463,38 +660,19 @@ class TestEngine(object):
         self._last_inst_state = None    # 仪器状态只在变化时打印
         all_rows = {}
         try:
-            self.log("连接 %s ..." % host)
             # fast=True：每频道要发 3 条命令，46 频道就是 138 条。
             # 心跳 bug 已修（以 CR/LF 帧结束为判据），fast 模式安全，
             # 否则每条命令固定等 1.5~2 秒，一张表要 4 分钟。
             self.conn = PromaxTelnet(host, self.port, timeout=timeout,
                                      fast=True)
-            try:
-                self.conn.connect()
-            except PromaxError as e:
-                self.log("连接失败: %s" % e)
+            self.timeout_run = timeout
+            self.reconnects = 0
+            # 🔴 首连/预检失败也**不直接结束**，而是挂起等重连：
+            #    仪器走 WiFi 时"点开始时链路还没上来"很常见，
+            #    挂起后能自动/手动重试，不用整个重来。
+            if not self._connect_and_probe():
                 self.emit(self.MSG_STOPPED)
                 return
-
-            # ---- 预检：确认仪器真的应答，再开始跑 ----
-            # TCP 连上不代表仪器接受命令（单会话被占/忙/前面板界面都会
-            # 导致"连得上但收不到 ACK"）。先发一条 ?VER 探活。
-            self.log("预检：发送 *?VER 确认仪器应答...")
-            pv = self.conn.command("?VER", timeout=min(timeout, 10.0))
-            if pv.get("status") != "ack":
-                self.log("")
-                self.log("!! 仪器没有应答（%s）" % pv.get("status"))
-                self.log("   TCP 已连上，但命令发不出去。常见原因：")
-                self.log("   1. 仪器只允许一个 telnet 会话，上一个会话没干净断开")
-                self.log("      → 等 1~2 分钟，或在仪器上断开远程控制")
-                self.log("   2. 仪器正忙（正在测量/扫描/捕获）")
-                self.log("   3. 前面板停在需要确认的界面 → 回到主界面")
-                self.log("   4. telnet 服务被关 → Preferences → Network 重新开启")
-                self.log("   可用浏览器打开 http://%s/ 看仪器是否活着" % host)
-                self.emit(self.MSG_STOPPED)
-                self.close()
-                return
-            self.log("   仪器应答：%s" % (pv["lines"][0] if pv["lines"] else "OK"))
 
             for n, item in enumerate(items, 1):
                 if self._stop.is_set():
@@ -773,6 +951,12 @@ class App(object):
         self.stop_btn = ttk.Button(top, text="中止", command=self.stop,
                                    state="disabled")
         self.stop_btn.pack(side="left")
+        # 🔴 断线重试：仪器走 WiFi 时链路会抖。断线后测试**暂停**而不是中断，
+        #    点这里立刻重连，并从**当前频点**继续（已测完的不会重测）。
+        #    默认还会定时自动重连，所以不点它也能自愈。
+        self.retry_btn = ttk.Button(top, text="重试连接", command=self.retry_conn,
+                                    state="disabled")
+        self.retry_btn.pack(side="left", padx=(4, 0))
         ttk.Button(top, text="设置", command=self._open_settings
                    ).pack(side="left", padx=6)
         self.status = tk.StringVar(value="就绪")
@@ -1080,7 +1264,10 @@ class App(object):
         win.title("设置")
         win.transient(self.root)
         win.grab_set()
-        win.geometry("940x680")
+        # 高度要给足：「基本」页有 IP/端口/窗口/暂停/导出/列裁剪/重连 +
+        # 分频段参数两栏，内容比早期版本多，太矮会把下面的输入框挤出可视区
+        # （ttk.Notebook 不会自动滚动，超出就真的看不到）。
+        win.geometry("940x800")
         win.minsize(820, 600)
 
         # ⚠️ 从磁盘重读：用户可能手动改过 json，用内存里的旧 self.cfg 会
@@ -1158,6 +1345,26 @@ class App(object):
         ttk.Label(f1, text="固定：不输出 LEVEL（卫星只报 POWER）",
                   foreground="#777").grid(row=r, column=1, columnspan=2,
                                          sticky="w", pady=4)
+        # ---- 断线自动重连（仪器走 WiFi 时链路会抖）----
+        # 做成一行（开关 + 间隔），否则 f1 会超出窗口高度把下面的分频段参数挤掉
+        r += 1
+        ttk.Label(f1, text="断线自动重连").grid(row=r, column=0, sticky="w",
+                                            pady=4)
+        rrow = ttk.Frame(f1)
+        rrow.grid(row=r, column=1, columnspan=2, sticky="w", pady=4)
+        auto_var = tk.StringVar(
+            value="yes" if self.cfg.get("auto_reconnect", True) else "no")
+        ttk.Combobox(rrow, textvariable=auto_var, width=5,
+                     values=["yes", "no"], state="readonly"
+                     ).pack(side="left")
+        ttk.Label(rrow, text="每", foreground="#777").pack(side="left",
+                                                         padx=(8, 2))
+        e_ri = ttk.Entry(rrow, width=6, justify="right")
+        e_ri.insert(0, str(self.cfg.get("reconnect_interval", 10.0)))
+        e_ri.pack(side="left")
+        ttk.Label(rrow, text="秒自动重连（最小 2 秒）；"
+                             "断线后测试暂停，恢复即从当前频点续跑",
+                  foreground="#777").pack(side="left", padx=(2, 0))
 
         # ---- 分频段：射频 / 卫星 两栏并排，一目了然 ----
         r += 1
@@ -1195,8 +1402,8 @@ class App(object):
                 ents[key] = e
             lf.columnconfigure(2, weight=1)
 
-        ttk.Label(f1, text="锁定失败时自动重试，每次把稳定等待 +步进 秒\n"
-                           "重试用尽仍失败会记为「锁定失败」并写入结果表",
+        ttk.Label(f1, text="锁定失败时自动重试：每次把稳定等待 +步进 秒；"
+                           "用尽仍失败会记为「锁定失败」并写入结果表",
                   foreground="#777", justify="left"
                   ).grid(row=r + 1, column=0, columnspan=3,
                          sticky="w", pady=(0, 4))
@@ -1376,6 +1583,14 @@ class App(object):
                 base["export_format"] = (
                     "csv" if fmt_var.get().strip().lower() == "csv"
                     else "xlsx")
+                # ---- 断线自动重连 ----
+                base["auto_reconnect"] = auto_var.get().strip().lower() in (
+                    "yes", "y", "true", "1", "on", "是")
+                try:
+                    base["reconnect_interval"] = max(
+                        2.0, float(e_ri.get().strip()))
+                except ValueError:
+                    base["reconnect_interval"] = 10.0
                 # 分频段参数（注意：变量名不要用 txt，会覆盖上面的预设 Text 控件）
                 for key, e in ents.items():
                     v = e.get().strip()
@@ -1472,6 +1687,7 @@ class App(object):
         self.log.configure(state="disabled")
 
         self.stop_btn.configure(state="normal")
+        self.retry_btn.configure(state="disabled")   # 新的一轮：先复位重连按钮
         self.status.set("测试中...")
         self.root.title("PROMAX 频道表批量测试 — 测试中")
 
@@ -1502,6 +1718,16 @@ class App(object):
         if self.engine:
             self.engine.stop()
             self.status.set("正在停止...")
+
+    def retry_conn(self):
+        """点「重试连接」：立刻唤醒后台线程去重连（不阻塞 UI）。
+
+        后台的 _wait_reconnect 收到信号后会立刻试一次；
+        重连成功即从当前频点继续，失败则回到等待（日志里会说明原因）。
+        """
+        if self.engine:
+            self.status.set("正在重连...")
+            self.engine.retry_connect()
 
     def _on_close(self):
         """关窗口：先停测试、断开连接，再销毁窗口。
@@ -1579,6 +1805,21 @@ class App(object):
             self._log("【%s】完成，共 %d 个频道" % (item.name, len(rows)))
         elif kind == TestEngine.MSG_CONFIRM:
             self._confirm(payload)
+        elif kind == TestEngine.MSG_NETLOST:
+            # 断线：测试已暂停（后台在等重连）。亮出「重试连接」，状态栏说明情况。
+            self.retry_btn.configure(state="normal")
+            self.status.set("网络中断，已暂停 — 等待重连")
+            self.root.title("PROMAX 频道表批量测试 — 已暂停（网络中断）")
+            self._log("")
+            self._log("!! 与仪器的连接断开，测试已**暂停**（数据不丢）。")
+            self._log("   点「重试连接」立即重试；默认也会定时自动重连；")
+            self._log("   点「中止」则结束本次测试并保存已测得的结果。")
+        elif kind == TestEngine.MSG_NETOK:
+            self.retry_btn.configure(state="disabled")
+            n = self.engine.reconnects if self.engine else 0
+            self.status.set(("测试中...（已重连 %d 次）" % n) if n else "测试中...")
+            self.root.title("PROMAX 频道表批量测试 — 测试中")
+            self._log("   连接已恢复（累计重连 %d 次），继续测试。" % n)
         elif kind in (TestEngine.MSG_FINISH, TestEngine.MSG_STOPPED):
             pass    # 由 _poll 线程结束后统一收尾
 
@@ -1818,6 +2059,16 @@ class App(object):
 
     def _finish_ui(self):
         self.stop_btn.configure(state="disabled")
+        self.retry_btn.configure(state="disabled")   # 测试结束
+
+        # 断线统计：让用户一眼看到本次受过几次网络影响
+        try:
+            n = self.engine.reconnects if self.engine else 0
+        except Exception:
+            n = 0
+        if n:
+            self._log("")
+            self._log("【网络恢复】本次测试期间断线重连 %d 次（数据已保留）。" % n)
         stopped = self.engine and self.engine._stop.is_set()
         self.root.title("PROMAX 频道表批量测试")
         if self.rows:
