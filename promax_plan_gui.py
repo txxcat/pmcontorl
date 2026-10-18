@@ -154,15 +154,26 @@ class TestEngine(object):
         self.reconnects = 0
         # 当前这张表的频点总数（日志里显示「第 n/总」用），_run_points 里赋值
         self._pt_total = 0
+        # 本趟的第几个频点（**日志序号**，与 row["idx"] 分开）：
+        # 正常测试时两者相同；「重测失败频道」时只跑几个频点，
+        # 序号是 1..n，而 row["idx"] 仍保留原始频道序号（结果表里位置不变）。
+        self._pt_seq = 0
+        # 失败频点（未锁定 / 设置失败）：供「重测失败频道」用
+        # 每项 = (item, idx, (mhz, sig, chname, sr), 原因)
+        self.failures = []
+        # 重测模式：{item.key: [(idx, point), ...]}，空 = 正常跑整表
+        self._subset = {}
 
     def _ptag(self, idx):
         """频点日志前缀：`[  3/20]`。
 
         总数取自当前表（_run_points 设置）。取不到总数（极端情况）就退化成 `[  3]`，
         不显示成 `[3/0]` 那种误导性的分母。
+        序号优先用 `_pt_seq`（本趟第几个），重测时才不会打印出 `[  7/3]`。
         """
         t = getattr(self, "_pt_total", 0)
-        return "[%3d/%d]" % (idx, t) if t else "[%3d]" % idx
+        n = getattr(self, "_pt_seq", 0) or idx
+        return "[%3d/%d]" % (n, t) if t else "[%3d]" % n
 
     def stop(self):
         self._stop.set()
@@ -584,7 +595,13 @@ class TestEngine(object):
         """
         self._cur = {"sig": None, "sat": None}   # 制式缓存（本表内有效）
         self.no_resp = 0        # 连续无响应计数，达到阈值就按断线处理
-        pts = item.points()
+        # 重测模式：只跑指定的几个频点（键 = item.key）
+        sub = (self._subset or {}).get(item.key)
+        if sub:
+            pts = list(sub)                      # [(原始序号, (mhz,sig,ch,sr))]
+            self.log("  [重测] 本表只跑 %d 个未成功频道" % len(pts))
+        else:
+            pts = [(k + 1, p) for k, p in enumerate(item.points())]
         # 本表频点总数：日志里统一显示「第 n/总数」，一眼看得出还剩多少
         self._pt_total = len(pts)
         rows = []
@@ -593,11 +610,12 @@ class TestEngine(object):
             if self._stop.is_set():
                 self.log("  [中止] 用户停止测试")
                 break
-            mhz, sig, chname, sr = pts[i]
+            idx, (mhz, sig, chname, sr) = pts[i]
             i += 1
+            self._pt_seq = i        # 日志序号 = 本趟第几个（重测时 ≠ 原始序号）
             try:
                 row = self._one_point(item, analog, inst, mhz, sig, chname, sr,
-                                      i, settle, retry, retry_step)
+                                      idx, settle, retry, retry_step)
             except PromaxConnLost as e:
                 self.log("  [断线] %s" % e)
                 ok, inst = self._recover(item, analog, inst, str(e))
@@ -611,6 +629,17 @@ class TestEngine(object):
             if row is not None:
                 rows.append(row)
                 self.emit(self.MSG_ROW, (item, row))
+                # 未锁定 → 记下来，收尾时汇总成「重测失败频道」的待办。
+                # ⚠️ 模拟制式（ANALOG）本来就不报 LOCKED=ON（连续载波），
+                #    不能算失败，否则射频表整张都会被列进去。
+                if (not analog) and str(row.get("LOCKED", "")).upper() != "ON":
+                    self.failures.append(
+                        (item, idx, (mhz, sig, chname, sr),
+                         "未锁定（尝试 %d 次）" % row.get("attempts", 0)))
+            else:
+                # 设置阶段就失败了（NAK / 无应答），连行都没有 → 同样要能重测
+                self.failures.append(
+                    (item, idx, (mhz, sig, chname, sr), "设置失败 / 无应答"))
         return rows
 
     def _recover(self, item, analog, inst, reason):
@@ -717,9 +746,14 @@ class TestEngine(object):
             row["OFFSET_unit"] = ou or "Hz"
         return row
 
-    def run(self, host, items, cfg=None, timeout=20.0, pause_between=True):
+    def run(self, host, items, cfg=None, timeout=20.0, pause_between=True,
+            subset_map=None):
         self.host = host
         self.cfg_run = cfg or {}
+        # 重测模式：subset_map = {item.key: [(原始序号, point), ...]}
+        # 给了就只跑这些频点（「重测失败频道」用），否则正常跑整表
+        self._subset = subset_map or {}
+        self.failures = []
         self._last_inst_state = None    # 仪器状态只在变化时打印
         all_rows = {}
         try:
@@ -762,9 +796,10 @@ class TestEngine(object):
                         self.log("--- 继续第 %d/%d 张表：%s（已配置表间不暂停）---"
                                  % (n, len(items), item.name))
                 self.log("")
-                self.log(">>> [%d/%d] %s (%s, %d 个频道)"
+                _n_pt = len(self._subset.get(item.key, ())) or len(item.points())
+                self.log(">>> [%d/%d] %s (%s, %s%d 个频道)"
                          % (n, len(items), item.name, item.band,
-                            len(item.points())))
+                            "重测 " if self._subset else "", _n_pt))
                 try:
                     # 每张表按自己的频段取稳定等待/重试参数（卫星锁定慢，要分开设）
                     st, rt, stp = band_settings(self.cfg_run, item.band)
@@ -1020,7 +1055,13 @@ class App(object):
         self._t_acc = 0.0
         self._t_t0 = None
         self._t_on = False
+        self._t_paused = False
         self._tick_ac = None
+
+        # 失败频道（未锁定 / 设置失败）：收尾时从引擎汇总，供「重测失败频道」
+        self.pending_retest = []
+        self.retesting = False          # 当前这轮是不是"只重测失败频道"
+        self._retest_subset = {}        # {item.key: [(原始序号, point), ...]}
 
         root.title("PROMAX 频道表批量测试")
         w = self.cfg.get("window", {})
@@ -1062,6 +1103,14 @@ class App(object):
         self.retry_btn = ttk.Button(top, text="重试连接", command=self.retry_conn,
                                     state="disabled")
         self.retry_btn.pack(side="left", padx=(4, 0))
+        # 🔴 「重测失败频道」：一轮跑完后只补测未锁定 / 设置失败的那几条，
+        #    结果按频道名覆盖回**同一个结果文件**。
+        #    这是本程序的核心痛点（卫星批量测试个别频道锁不上 → 数据不全），
+        #    以前只能整场重跑，白测几十个正常频道。
+        self.retest_btn = ttk.Button(top, text="重测失败频道",
+                                     command=self.retest_failed,
+                                     state="disabled")
+        self.retest_btn.pack(side="left", padx=(4, 0))
         ttk.Button(top, text="设置", command=self._open_settings
                    ).pack(side="left", padx=6)
         self.status = tk.StringVar(value="就绪")
@@ -1217,13 +1266,26 @@ class App(object):
         self.pg_all_total = sum(len(it.points()) for it in items)
         self._update_progress()
 
+    def _pg_reset_subset(self, by_item):
+        """重测模式：两条进度条按**要重测的频道数**归零。"""
+        self.pg_cur_done = 0
+        self.pg_cur_total = 0
+        self.pg_all_done = 0
+        self.pg_all_total = sum(len(v) for v in by_item.values())
+        self._update_progress()
+
     # ---------------- 计时器 ----------------
     # 需求：顶栏显示本轮测试用时，**暂停时同时停表**。
     # 「暂停」有三种：断线挂起（MSG_NETLOST→NETOK）、换线暂停（MSG_CONFIRM，
     # 等用户点「继续」）、以及测试彻底结束。三者都走 _timer_pause，
     # 恢复走 _timer_resume，结束走 _timer_stop（保留最终用时）。
-    def _timer_set(self, paused=False):
-        """把当前用时刷到顶栏。paused=True 时补一句「已暂停」。"""
+    def _timer_set(self):
+        """把当前用时刷到顶栏。
+
+        ⚠️ 「（已暂停）」标记必须由 `_t_paused` 决定，不能由调用方传参：
+        暂停期间 200ms 的 `_timer_tick` 还在跑，它调 `_timer_set()` 时若不带
+        标记，就会把刚打上的「已暂停」冲掉（表现时有时无，测试抓到过）。
+        """
         e = self._t_acc
         if self._t_t0 is not None:
             e += time.monotonic() - self._t_t0
@@ -1231,7 +1293,7 @@ class App(object):
             self.timer_var.set("用时 —")     # 还没跑过
             return
         txt = "用时 " + _fmt_hms(e)
-        if paused:
+        if self._t_on and self._t_paused:
             txt += "（已暂停）"
         self.timer_var.set(txt)
 
@@ -1256,6 +1318,7 @@ class App(object):
         self._t_acc = 0.0
         self._t_t0 = time.monotonic()
         self._t_on = True
+        self._t_paused = False
         self._timer_set()
         self._timer_tick()
 
@@ -1264,7 +1327,9 @@ class App(object):
         if self._t_t0 is not None:
             self._t_acc += time.monotonic() - self._t_t0
             self._t_t0 = None
-        self._timer_set(paused=True)
+        if self._t_on:
+            self._t_paused = True
+        self._timer_set()
 
     def _timer_resume(self):
         """继续计时（已在跑就不动）。"""
@@ -1272,12 +1337,14 @@ class App(object):
             return
         if self._t_t0 is None:
             self._t_t0 = time.monotonic()
+        self._t_paused = False
         self._timer_set()
 
     def _timer_stop(self):
         """测试结束：停表并保留最终用时，返回总秒数。"""
         self._timer_pause()          # 先收掉最后一段
         self._t_on = False
+        self._t_paused = False       # 定格时不带「已暂停」
         self._timer_cancel_tick()
         self._timer_set()
         return self._t_acc
@@ -1965,6 +2032,11 @@ class App(object):
 
         self.stop_btn.configure(state="normal")
         self.retry_btn.configure(state="disabled")   # 新的一轮：先复位重连按钮
+        # 新的一轮：清掉上一轮的"失败频道"待办
+        self.pending_retest = []
+        self.retesting = False
+        self._retest_subset = {}
+        self.retest_btn.configure(text="重测失败频道", state="disabled")
         self._timer_start()                          # 计时从这一刻起
         self.status.set("测试中...")
         self.root.title("PROMAX 频道表批量测试 — 测试中")
@@ -2006,6 +2078,74 @@ class App(object):
         if self.engine:
             self.status.set("正在重连...")
             self.engine.retry_connect()
+
+    def retest_failed(self):
+        """只重测上一轮未成功的频道，结果**覆盖合并**回同一个结果文件。
+
+        设计要点
+        --------
+        · 已成功的频道一条都不重测 —— 这正是本功能的意义（卫星整表重跑太贵）
+        · 行按频道名覆盖，不产生重复行；收尾保存前按 idx 排序，位置与原表一致
+        · 表级准备照做（切频段 / LNB / 校验 BAND）：重测可能跨表、跨频段
+        · 断线重连、计时器、进度条全部复用正常测试那一套
+        """
+        if not self.pending_retest:
+            return
+        if self.thread and self.thread.is_alive():
+            messagebox.showwarning("正在测试", "当前还有测试在跑，等它结束再重测")
+            return
+        out = self.out_path or ""
+        if not out:
+            messagebox.showwarning("没有结果文件",
+                                   "上一轮没有保存结果，无法把重测数据合并进去")
+            return
+        # 按表分组（表顺序沿用本次测试的选中顺序）
+        order = {it.key: n for n, it in enumerate(self.items)}
+        by_item = {}
+        for item, idx, pt, why in self.pending_retest:
+            by_item.setdefault(item.key, []).append((idx, pt))
+        items = [it for it in self.items if it.key in by_item]
+        items.sort(key=lambda it: order.get(it.key, 0))
+        names = "、".join("%s(%d)" % (it.name, len(by_item[it.key])) for it in items)
+        if not messagebox.askyesno(
+                "重测失败频道",
+                "上一轮有 %d 个频道未成功：\n%s\n\n只重测这些频道，结果合并到：\n%s\n\n"
+                "（已成功的频道不会重测）"
+                % (len(self.pending_retest), names, out)):
+            return
+
+        ip = self.ip_var.get().strip()
+        if not ip:
+            messagebox.showwarning("缺少IP", "请先填写仪器 IP 地址")
+            return
+        self._save_ip()
+        self._retest_subset = by_item
+        self._retest_prev = list(self.pending_retest)   # 收尾时要把没跑完的并回去
+        self.retesting = True
+        self._pg_reset_subset(by_item)
+        self._timer_start()
+        self.stop_btn.configure(state="normal")
+        self.retry_btn.configure(state="disabled")
+        self.retest_btn.configure(state="disabled")
+        self.status.set("重测中...")
+        self.root.title("PROMAX 频道表批量测试 — 重测失败频道")
+        self.q = queue.Queue()
+        try:
+            port = int(self.port_var.get())
+        except (TypeError, ValueError):
+            port = 2222
+        self.engine = TestEngine(self.q, port)
+        self._log("")
+        self._log("=" * 60)
+        self._log("【重测失败频道】共 %d 个：%s" % (len(self.pending_retest), names))
+        self._log("=" * 60)
+        self.thread = threading.Thread(
+            target=self.engine.run,
+            args=(ip, items, self.cfg, 20.0, False),      # 重测不暂停（同一张表内跑完）
+            kwargs={"subset_map": by_item},
+            daemon=True)
+        self.thread.start()
+        self.root.after(120, self._poll)
 
     def _on_close(self):
         """关窗口：先停测试、断开连接，再销毁窗口。
@@ -2056,12 +2196,47 @@ class App(object):
                 pass
             self._finish_ui()
 
+    def _store_row(self, item, row):
+        """把一条结果收进 self.rows。
+
+        重测模式下**按频道名覆盖**同行（同一个频道不该在表里出现两行），
+        正常测试直接追加。行的先后顺序由收尾时按 idx 排序保证
+        （重测的行是"补回来"的，追加在末尾会跑到表格最后）。
+        """
+        lst = self.rows.setdefault(item.name, [])
+        if self.retesting:
+            for i, old in enumerate(lst):
+                if old.get("ch") == row.get("ch"):
+                    lst[i] = row
+                    return
+        lst.append(row)
+
+    def _collect_failures(self):
+        """从引擎收集失败频道，按 (表, 频道名) 去重后返回。"""
+        seen, out = set(), []
+        for item, idx, pt, why in (getattr(self.engine, "failures", None) or []):
+            k = (item.key, pt[2])
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append((item, idx, pt, why))
+        return out
+
+    def _update_retest_btn(self):
+        """按"有没有失败频道 / 有没有结果文件 / 是否正在跑"刷新重测按钮。"""
+        n = len(self.pending_retest)
+        busy = bool(self.thread and self.thread.is_alive())
+        self.retest_btn.configure(
+            text=("重测失败频道 (%d)" % n) if n else "重测失败频道",
+            state=("normal" if (n and self.out_path and not busy)
+                   else "disabled"))
+
     def _handle(self, kind, payload):
         if kind == TestEngine.MSG_LOG:
             self._log(payload)
         elif kind == TestEngine.MSG_ROW:
             item, row = payload
-            self.rows.setdefault(item.name, []).append(row)
+            self._store_row(item, row)
             parts = []
             # 注意：射频(TER)没有 OFFSET 键，必须用「键存在且非空」判断，
             # 不能用 != ""（键缺失时 get() 返回 None，None != "" 为 True 会误入分支）
@@ -2090,7 +2265,9 @@ class App(object):
             item = payload
             self.sel_active = item.key
             # 换表了：本表进度归零、总数换成这张表的频点数
-            self.pg_cur_total = len(item.points())
+            # （重测模式下是"本表要重测的频道数"，不是整表频道数）
+            self.pg_cur_total = (len(self._retest_subset.get(item.key, ()))
+                                 or len(item.points()))
             self.pg_cur_done = 0
             self._paint_sel()
             self._update_progress()
@@ -2391,9 +2568,40 @@ class App(object):
         self._log("")
         self._log("【用时】本轮净用时 %s（断线等待 / 换线暂停不计入）"
                   % _fmt_hms(used))
+        # 失败频道：未锁定的 + 设置阶段就失败的（后者连行都没有）
+        # 🔴 重测模式要**并上"还没补测的那些"**：这一轮只跑了 3 个频道，
+        #    引擎的 failures 只反映这 3 个，剩下没跑的不能凭空消失。
+        was_retest = self.retesting
+        new_fail = self._collect_failures()
+        if was_retest:
+            done = {(k, pt[2]) for k, lst in self._retest_subset.items()
+                    for _i, pt in lst}
+            kept = [f for f in getattr(self, "_retest_prev", [])
+                    if (f[0].key, f[2][2]) not in done]
+            self.pending_retest = kept + new_fail
+        else:
+            self.pending_retest = new_fail
+        if self.pending_retest:
+            by = {}
+            for item, idx, pt, why in self.pending_retest:
+                by.setdefault(item.name, []).append(pt[2])
+            self._log("")
+            self._log("【未成功】%d 个频道：%s"
+                      % (len(self.pending_retest),
+                         "；".join("%s: %s" % (k, "、".join(v))
+                                   for k, v in by.items())))
+            self._log("   点工具栏「重测失败频道」只补测这些频道，"
+                      "结果合并进同一个文件（已成功的不重测）。")
         stopped = self.engine and self.engine._stop.is_set()
         self.root.title("PROMAX 频道表批量测试")
         if self.rows:
+            # 重测回来的行是"覆盖/追加"进去的 → 保存前按原始序号重排，
+            # 保证结果表里的频道顺序与频道表一致（不会把补测的行堆到末尾）
+            for _rows in self.rows.values():
+                try:
+                    _rows.sort(key=lambda r: int(r.get("idx") or 0))
+                except (TypeError, ValueError):
+                    pass
             ok, path = self._save_with_retry(self.out_path)
             if ok:
                 self.out_path = path
@@ -2418,7 +2626,7 @@ class App(object):
                     self._close_log_file()
                 if self.sep_log_path:
                     self._log("独立日志: %s（本次，覆盖）" % self.sep_log_path)
-                if not stopped and messagebox.askyesno(
+                if not stopped and not was_retest and messagebox.askyesno(
                         "完成", "测试完成，结果已保存：\n%s\n\n现在打开文件吗？"
                                 % path):
                     self._open(path)
@@ -2430,6 +2638,30 @@ class App(object):
             self.status.set("中止" if stopped else "无数据")
             self._log("没有可保存的数据")
             self._close_log_file()
+
+        # ---- 收尾：刷新「重测失败频道」按钮；重测则报告结果 ----
+        tried = 0
+        if was_retest:
+            tried = sum(len(v) for v in self._retest_subset.values())
+            self._log("")
+            self._log("【重测完成】本次重测 %d 个频道，其中 %d 个仍未成功。"
+                      % (tried, len(self.pending_retest)))
+        self.retesting = False
+        self._update_retest_btn()
+        if was_retest and not stopped:
+            if self.pending_retest:
+                messagebox.showwarning(
+                    "重测完成",
+                    "重测结束：%d 个频道仍未成功（%s）。\n\n结果已更新到：\n%s"
+                    % (len(self.pending_retest),
+                       "、".join(sorted({pt[2] for _i, _x, pt, _w
+                                         in self.pending_retest})),
+                       self.out_path))
+            else:
+                messagebox.showinfo(
+                    "重测完成",
+                    "全部 %d 个频道已成功锁定，结果已更新：\n%s"
+                    % (tried, self.out_path))
 
     # ---------------- 读取日志（设置窗按钮）----------------
     def _view_log(self, parent=None):
