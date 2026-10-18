@@ -47,6 +47,8 @@ from promax_gui_config import (CONFIG_NAME, band_settings, date6, date8,
                                log_path, match_preset, preset_filename,
                                preset_pause, presets, save_config)
 from promax_plan_dump import load_plans, parse_plan_xml
+from promax_plan_write import (convert_result_file, default_promax_path,
+                               write_promax_for_results)
 from promax_telnet_test import (PromaxTelnet, Promax, PromaxError,
                                 PromaxConnLost, parse_measure_all,
                                 parse_tune_ch)
@@ -1026,6 +1028,7 @@ class App(object):
     def __init__(self, root, source):
         self.root = root
         self.cfg = load_config()
+        self.source = source       # 频道表目录（转换 Promax 时要回查下行）
         self.items = []            # 全部 PlanItem
         self.check_vars = {}       # name -> IntVar
         self.active_preset = None  # 当前应用的预设（决定表间是否暂停）
@@ -1190,6 +1193,9 @@ class App(object):
         ttk.Entry(right, textvariable=self.out_var).pack(fill="x", pady=(4, 0))
         ttk.Label(right, text="文件名可用 {date8}/{date6} 占位符",
                   foreground="#777").pack(anchor="w")
+        # 结果 → Promax 仪器格式（给只认仪器导出 XML 的程序用）
+        ttk.Button(right, text="转换成Promax格式文件",
+                   command=self.convert_promax).pack(anchor="w", pady=(6, 0))
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
 
@@ -1674,6 +1680,13 @@ class App(object):
                 self.out_var.set(base + want)
         fmt_var.trace_add("write", _sync_fmt)
         r += 1
+        # ---- 同时生成 Promax 格式（给只认仪器导出文件的第三方软件）----
+        ttk.Label(f1, text="Promax 格式").grid(row=r, column=0, sticky="w", pady=4)
+        promax_var = tk.BooleanVar(value=bool(self.cfg.get("export_promax", False)))
+        ttk.Checkbutton(f1, text="同时生成 Promax 格式文件（.XML）",
+                        variable=promax_var).grid(row=r, column=1, columnspan=2,
+                                                  sticky="w", pady=4)
+        r += 1
         ttk.Label(f1, text="射频列裁剪").grid(row=r, column=0, sticky="w", pady=4)
         ttk.Label(f1, text="固定：不输出 OFFSET / SR（射频无此概念）",
                   foreground="#777").grid(row=r, column=1, columnspan=2,
@@ -1921,6 +1934,7 @@ class App(object):
                 base["export_format"] = (
                     "csv" if fmt_var.get().strip().lower() == "csv"
                     else "xlsx")
+                base["export_promax"] = bool(promax_var.get())
                 # ---- 断线自动重连 ----
                 base["auto_reconnect"] = auto_var.get().strip().lower() in (
                     "yes", "y", "true", "1", "on", "是")
@@ -2357,6 +2371,51 @@ class App(object):
         win.protocol("WM_DELETE_WINDOW", lambda: go(False))
 
     # ---------------- 输出文件处理 ----------------
+    def _downlink_map(self):
+        """(表名, 频道名) → 下行 MHz。
+
+        我们结果里卫星存的是**中频**（发仪器的就是 IF），而 Promax 格式写的是
+        `downlink`（下行）。用当前加载的频道表把两者对上。
+        """
+        m = {}
+        for it in getattr(self, "items", None) or []:
+            for c in getattr(it, "channels", None) or []:
+                f = c.get("freq_mhz")
+                if f is not None:
+                    m[(str(it.name).strip(), str(c.get("name")).strip())] = f
+        return m
+
+    def convert_promax(self):
+        """把已有的 xlsx / csv 结果转成 Promax 格式 XML（不连仪器）。"""
+        cur = self.out_var.get().strip()
+        init_dir = os.path.dirname(cur) if cur else ""
+        if not init_dir or not os.path.isdir(init_dir):
+            init_dir = self.outdir_var.get().strip() or default_out_dir(self.cfg)
+        src = filedialog.askopenfilename(
+            title="选择要转换的结果文件（xlsx / csv）",
+            initialdir=init_dir if os.path.isdir(init_dir) else None,
+            filetypes=[("结果文件", "*.xlsx *.csv"), ("Excel 表格", "*.xlsx"),
+                       ("CSV 文本", "*.csv"), ("所有文件", "*.*")])
+        if not src:
+            return
+        dst = default_promax_path(src)
+        if os.path.exists(dst) and not messagebox.askyesno(
+                "文件已存在", "已存在：\n%s\n\n覆盖它？" % dst):
+            return
+        try:
+            dst, n = convert_result_file(src, dst, self._downlink_map(),
+                                         plans_dir=getattr(self, "source", None))
+        except Exception as e:
+            self._log("!! Promax 格式转换失败：%s" % e)
+            messagebox.showerror("转换失败", "%s\n\n%s" % (src, e))
+            return
+        self.status.set("已生成 %s" % os.path.basename(dst))
+        self._log("")
+        self._log("已生成 Promax 格式文件: %s（%d 个频道）" % (dst, n))
+        messagebox.showinfo("转换完成",
+                            "已生成 Promax 格式文件：\n%s\n\n共 %d 个频道"
+                            % (dst, n))
+
     def _resolve_output_path(self, out):
         """同名文件提示覆盖/改名。返回最终路径，取消则返回 None"""
         if not (out.lower().endswith(".xlsx") or out.lower().endswith(".csv")):
@@ -2611,6 +2670,16 @@ class App(object):
                 self._log("共 %d 张表, %d 条记录"
                           % (len(self.rows),
                              sum(len(v) for v in self.rows.values())))
+                # 设置里开了「同时生成 Promax 格式」→ 再落一份 .XML
+                # （给只认仪器导出文件的第三方软件；失败不影响结果文件）
+                if self.cfg.get("export_promax", False):
+                    try:
+                        px, nch = write_promax_for_results(
+                            self.rows, default_promax_path(path),
+                            self._downlink_map())
+                        self._log("Promax 文件: %s（%d 个频道）" % (px, nch))
+                    except Exception as e:
+                        self._log("!! Promax 文件生成失败：%s" % e)
                 if self.log_path:
                     # 收尾：写"测试结束"再关闭（追加式，不删历史）
                     summary = ("【本次汇总】%d 张表 / %d 条记录，净用时 %s\n"

@@ -22,6 +22,11 @@ bak/
 *.csv
 *.log
 *.tgz
+# Promax 格式结果 XML（同样是真实测量数据）；
+# ⚠️ 否定规则必须写在 `*.XML` **之后**，否则 CH/ 下的演示表会被重新忽略
+*.XML
+!CH/TER/DEMO-*.XML
+!CH/SAT/DEMO-*.XML
 
 # ---- PROMAX 官方手册（版权材料，不转发）----
 *.pdf

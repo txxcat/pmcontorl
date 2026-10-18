@@ -42,6 +42,24 @@
   结果按频道名覆盖回**同一个结果文件**（已成功的频道一条都不重测）。
   行的位置按原频道序号排好，不产生重复行；仍然失败的会继续留在待办里，可反复补测。
 - **结果导出**：xlsx（带表头样式）/ csv（utf-8-sig，Excel 直开），设置里可切
+- **Promax 格式文件（.XML）**：按仪器导出的 `POINT / CHANNEL-SET / CHANNEL`
+  结构（version 1.3）生成，供只认仪器导出文件的第三方软件读取。两个入口：
+  - 设置里勾「同时生成 Promax 格式文件」→ 每次保存结果时**顺带**落一份同名 `.XML`
+  - 界面右侧「转换成Promax格式文件」按钮 → 把**已有的** xlsx / csv 转成 `.XML`
+  - 命令行（不装 GUI 也能用）：`python promax_plan_write.py 结果.xlsx [-o out.XML]`
+
+  | 结果里的数据 | 写进 XML 的哪里 |
+  |---|---|
+  | 频道名 / 频率 | `CHANNEL name` / `frequency`（射频）或 `downlink` + `sat_band`（卫星） |
+  | 制式 | `<DVB-C>` / `<DVB-S>` / `<DVB-S2>`，模拟频道写 `<UNKNOWN>`（真机也这样） |
+  | LOCK | `STATUS value="MPEG2 TS locked" locked="LOCKED"`，未锁定写 `No signal received` / `UNLOCKED` |
+  | POWER / CN / MER / OFFSET | `<MEASURES>` 下同名元素（OFFSET 用 kHz，TE 表里是 Hz，会自动换算） |
+  | 符号率 | `<PARAMETERS><SYMBOLRATE value=".." units="kSymb/s" />` |
+
+  > 仪器还写 CONSTELLATION / CODERATE / CBER / VBER / LM / BANDWIDTH，
+  > 这些**测不到就不写** —— 宁可缺字段，也不编数据。
+  > 卫星结果里存的是**中频**，转 XML 时靠当前频道表回推真实下行（表不在时按
+  > 「频道名即下行」或本振推算兜底）。
 - **按频段裁剪结果列**（实测口径，避免无意义空列）：
   | 测试类型 | 列数 | 不输出 |
   |---|---|---|
@@ -139,6 +157,7 @@ python _test_highlight.py         # 「已选频道表」进度高亮（含真�
 python _test_progress.py          # 频点日志序号 + 两条进度条（含真跑模拟器的集成验证）
 python _test_timer.py             # 顶栏计时器：暂停停表 / 断线挂起不计时（含集成验证）
 python _test_retest.py            # 重测失败频道：只补测未成功的几条并合并回原文件
+python _test_promax.py            # Promax 格式导出 / 转换（结构、编码、口径、GUI 两个入口）
 ```
 
 ## 关于频道表数据
@@ -167,6 +186,7 @@ CH/
 | `promax_plan_dump.py` | 频道表 XML 解析（离线） |
 | `promax_telnet_test.py` | Telnet 连接层与命令封装 |
 | `promax_gui_config.py` | 配置层（json + 滚动备份到 `bak/` + 原子写） |
+| `promax_plan_write.py` | 写 Promax 仪器格式 XML / 读结果文件（也可单独当命令行用） |
 | `promax_plan_scan.py` | 命令行版（无 GUI） |
 | `mock_promax_server.py` | 仪器模拟器 |
 | `_selftest_mock.py` | 协议级自检（对模拟器跑） |
@@ -176,6 +196,7 @@ CH/
 | `_test_progress.py` | 频点日志序号 + 两条进度条测试（消息层 + 真跑模拟器集成） |
 | `_test_timer.py` | 顶栏计时器测试（暂停停表 + 真跑模拟器集成：暂停时长确实被扣掉） |
 | `_test_retest.py` | 「重测失败频道」测试（覆盖不重复 / 只跑待办频道 / 结果文件合并） |
+| `_test_promax.py` | Promax 格式导出测试（XML 结构 / 编码 / 数值口径 / xlsx·csv 转换） |
 | `_shot_settings.py` | 生成 README 用的三张界面截图（用演示配置，不碰真实数据） |
 | `CH/TER`, `CH/SAT` | 频道表目录（仅 DEMO-\* 入库） |
 

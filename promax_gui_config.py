@@ -12,6 +12,7 @@
   "settle": 0.15,
   "pause_between": true,
   "export_format": "xlsx",           # 结果文件格式：xlsx / csv
+  "export_promax": false,            # 同时生成 Promax 格式 .XML（默认关）
   "presets": [...]                   # 本地预设组（真实数据，不上传）
 }
 
@@ -77,6 +78,9 @@ DEFAULT_CONFIG = {
     "reconnect_interval": 10.0,   # 自动重连间隔（秒），下限 2
     # 结果文件格式：xlsx（带表头样式）/ csv（通用，Excel 可直接打开）
     "export_format": "xlsx",
+    # 保存结果时**同时**再生成一份 Promax 仪器格式的 .XML（版本 1.3 结构），
+    # 供只认仪器导出文件的第三方软件读取。默认关：多数人只要 xlsx/csv。
+    "export_promax": False,
     # ---- 日志 ----
     "log_dir": "",              # 空 = 当前工作目录
     "log_name": "promax_test.log",   # 单一日志文件名（追加写入）
