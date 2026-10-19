@@ -7,7 +7,7 @@ PROMAX 频道表批量测试 GUI
 特性
 ----
 * 频道表列表分「射频 TER」「卫星 SAT」两组，可单选、可跨组多选
-* IP 输入框带记忆，ComboBox 下拉可选（历史持久化到 plan_scan_gui.json）
+* IP 输入框带记忆，ComboBox 下拉可选（历史持久化到 config.json）
 * 输出文件名自动按规则生成，可改；默认目录为系统下载文件夹
     单选：<频道表名>_YYYYMMDD.<xlsx|csv>
     多选：SAT_YYYYMMDD / TER_YYYYMMDD（后缀跟随「导出格式」）

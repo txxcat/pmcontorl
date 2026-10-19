@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """配置层：json 配置 + 下载目录（注册表）+ 历史记录。
 
-配置文件 plan_scan_gui.json 结构（**该文件不随仓库分发**，见 .gitignore）：
+配置文件 config.json 结构（**该文件不随仓库分发**，见 .gitignore）：
 {
   "window": {"width": 1200, "height": 760},
   "ip_history": ["127.0.0.1"],
@@ -41,8 +41,8 @@ def _app_dir():
         return os.getcwd()
 
 
-CONFIG_NAME = os.path.join(_app_dir(), "plan_scan_gui.json")
-OLD_CONFIG_NAME = "plan_scan_gui.json"      # 旧版遗留的相对路径写法，用于迁移
+CONFIG_NAME = os.path.join(_app_dir(), "config.json")
+LEGACY_CONFIG_NAME = "plan_scan_gui.json"   # 旧版配置名，用于一次性迁移
 
 DEFAULT_CONFIG = {
     "window": {"width": 1240, "height": 780},
@@ -131,16 +131,25 @@ def load_config(path=None):
 
 
 def _migrate_old_path(path):
-    """旧版把配置存在 CWD 下的相对路径；若新位置还没有配置，
-    而 CWD 下那份存在，就搬过来（只搬一次，避免丢用户数据）。"""
+    """旧版配置名 plan_scan_gui.json → config.json 的一次性迁移。
+
+    两种旧位置都覆盖：① 与目标配置**同目录**的 plan_scan_gui.json
+    （改名前的正常装法，支持自定义 path）；② CWD 下的 plan_scan_gui.json
+    （2026-10-14 之前相对路径 bug 的装法）。
+    只在新配置**不存在**时搬过去（copy 不 move，旧文件留作人工兜底），
+    绝不覆盖用户已有数据。
+    """
     try:
-        if os.path.abspath(path) == os.path.abspath(OLD_CONFIG_NAME):
-            return                       # 本来就是同一份（脚本目录 == CWD）
         if os.path.isfile(path):
-            return                       # 新位置已有配置，不覆盖
-        cwd_old = os.path.join(os.getcwd(), OLD_CONFIG_NAME)
+            return                       # 新配置已存在，不覆盖
+        import shutil
+        old_same = os.path.join(os.path.dirname(os.path.abspath(path)),
+                                LEGACY_CONFIG_NAME)
+        if os.path.isfile(old_same):
+            shutil.copy2(old_same, path)
+            return
+        cwd_old = os.path.join(os.getcwd(), LEGACY_CONFIG_NAME)
         if os.path.isfile(cwd_old):
-            import shutil
             shutil.copy2(cwd_old, path)
     except Exception:
         pass
@@ -204,7 +213,7 @@ def _backup_config(path):
         basedir = os.path.dirname(os.path.abspath(path))
         bakdir = os.path.join(basedir, BACKUP_DIRNAME)
         os.makedirs(bakdir, exist_ok=True)
-        base = os.path.basename(path)       # 如 plan_scan_gui.json
+        base = os.path.basename(path)       # 如 config.json
         def bname(i):
             nm = (base + ".bak") if i == 1 else ("%s.bak%d" % (base, i))
             return os.path.join(bakdir, nm)
@@ -258,7 +267,7 @@ def default_out_dir(cfg):
 # --------------------------------------------------------------- 预设组
 # 🔴 仓库里只放**演示用**预设（指向 CH/ 下的 DEMO-* 演示频道表）。
 #    真实频道表从仪器导出、含实际运营数据，**不随仓库分发**（见 .gitignore）；
-#    用户自己的预设组写在本地 plan_scan_gui.json 里，同样不会上传。
+#    用户自己的预设组写在本地 config.json 里，同样不会上传。
 DEFAULT_PRESETS = [
     {"name": "射频数字_DEMO", "files": ["DEMO-Digital"],
      "filename": "射频数字_DEMO_{date8}", "pause": False},

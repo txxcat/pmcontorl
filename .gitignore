@@ -10,10 +10,12 @@ CH/SAT/*
 !CH/SAT/DEMO-*.XML
 
 # ---- 本地配置：真实 IP、真实预设组、输出目录历史 ----
-plan_scan_gui.json
-plan_scan_gui.json.tmp
-plan_scan_gui.json.bak*
-plan_scan_gui.json.bak[0-9]*
+config.json
+config.json.tmp
+config.json.bak*
+config.json.bak[0-9]*
+# 旧版配置名（改名前的机器上可能还在，一并挡掉）
+plan_scan_gui.json*
 # 滚动备份子目录（含真实 IP / 预设组）
 bak/
 

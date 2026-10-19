@@ -5,7 +5,7 @@
   docs/screenshot-settings.png    设置界面
 
 🔴 四道防线，缺一不可：
-  1. monkeypatch load_config —— 界面会自己从磁盘读 plan_scan_gui.json，
+  1. monkeypatch load_config —— 界面会自己从磁盘读 config.json，
      那里面有**真实仪器 IP** 与真实输出目录历史。
   2. 扫描**只含 DEMO-* 演示表的临时目录** —— 直接扫 CH/ 会把本地真实频道表
      （真实运营商表 / 真实卫星表名）列进界面并截进图里。
