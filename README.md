@@ -6,6 +6,17 @@
 > **目标仪器**：RANGERNeo 4 — High class field strength meter and spectrum analyzer with 4K decoder
 > （固件 `*VER 31.17`，Telnet 端口 `2222`）
 
+## 下载（Windows 免安装）
+
+不想装 Python 的同学直接下打包版：**[Releases 页面](https://github.com/txxcat/pmcontorl/releases/latest)**
+→ `pmcontrol-v1.0.0-win64.zip`（约 23 MB）→ 解压 → 进 `pmcontrol` 文件夹双击 `pmcontrol.exe`。
+
+- 已内置演示预设与演示频道表，**无需仪器即可体验完整流程**
+- 🔴 不要把 exe 单独拖出来运行，它依赖同目录的 `_internal`
+- 首次运行弹「Windows 已保护你的电脑」是正常的（未购买代码签名证书）：
+  点「更多信息」→「运行 anyway」
+- 仅支持 Windows 10/11 64 位
+
 **主界面**
 
 ![主界面](docs/pmcontorl_main.png)
@@ -123,6 +134,18 @@ python promax_plan_gui.py
 **开箱即可跑通界面与导出流程**，不需要真实仪器数据。
 
 连真实仪器：设置里把「默认 IP」改成仪器的地址（如 `192.168.x.x`），端口默认 `2222`。
+
+### 自己打包成 exe（PyInstaller）
+
+```bash
+pip install pyinstaller
+pyinstaller -D -w -i "PM Ranger Neo4.png" -n pmcontrol promax_plan_gui.py
+```
+
+产物在 `dist/pmcontrol/`（约 33 MB）。发布时把**整个文件夹**打成一个 zip，
+并一起放入 `CH/` 演示表与一份使用说明 —— 程序用 `_app_dir()` 定位配置与频道表，
+解压后换任意目录都能跑。注意：`config.json` 含真实 IP 与预设，**不要**打进包，
+首次运行会自动生成默认配置。
 
 ### 没有仪器？用模拟器
 
